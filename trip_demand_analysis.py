@@ -121,7 +121,7 @@ def daily_features(trips: pd.DataFrame, plan: pd.DataFrame) -> pd.DataFrame:
     # calendar days with no trucks at all are real zero-trip days
     full = pd.date_range(d["Nag_date"].min(), d["Nag_date"].max(), freq="D")
     d = d.set_index("Nag_date").reindex(full).rename_axis("Nag_date").reset_index()
-    d["trips"] = d["trips"].fillna(0)
+    d[["trips", "planned_qty"]] = d[["trips", "planned_qty"]].fillna(0)
     d["weekday"] = d["Nag_date"].dt.dayofweek
     dom = d["Nag_date"].dt.day
     dim = d["Nag_date"].dt.days_in_month
