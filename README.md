@@ -19,6 +19,7 @@ Put `nagare_data.parquet` next to the scripts or enter its path in the sidebar.
 
 ## Assumptions
 - A trip is one truck (`Truck_number`, falling back to `Consignement_no`) per `Nag_date` + `Supply_Time` (+ vendor in the planner).
+- In `trip_demand_analysis.py` a trip is one gate entry: truck + `Gate_entry_time`. A truck that leaves and comes back with new material counts again; rows sharing a truck and entry time are one trip.
 - Days come from `Nag_date`, not gate entry date.
 - Load per trip is in pieces, not volume.
 - `trip_demand_analysis.py` takes `Nag_qty` once per Schedule_no + Item line (it repeats on every truck row) and measures arrival as first gate entry minus Nag_date + Supply_Time.

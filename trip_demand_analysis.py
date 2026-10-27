@@ -47,8 +47,12 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     df["Vendor_code"] = df["Vendor_code"].fillna("").astype(str).str.strip()
     for c in ("Nag_qty", "Received_qty"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["truck_key"] = df["Truck_number"].astype("string").fillna(
+    truck = df["Truck_number"].astype("string").fillna(
         "CN-" + df["Consignement_no"].astype("string").fillna("NA"))
+    # A trip is one gate entry: the same truck coming back later with new
+    # material has a different entry time and counts as another trip.
+    df["trip_key"] = (truck.astype(str) + "@"
+                      + df["Gate_entry_time"].dt.strftime("%Y%m%d%H%M").fillna("NA"))
     df = df.dropna(subset=["Nag_date"])
     slot_dt = pd.to_datetime(df["Nag_date"].dt.strftime("%Y-%m-%d") + " "
                              + df["Supply_Time"], errors="coerce")
@@ -67,7 +71,7 @@ def load(path: str) -> pd.DataFrame:
 def build_trips(df: pd.DataFrame, split_loc: bool) -> pd.DataFrame:
     """One row per truck per day+slot (+location)."""
     keys = ["Nag_date", "Supply_Time"] + (["unloading_loc"] if split_loc else [])
-    trips = (df.groupby(keys + ["truck_key"])
+    trips = (df.groupby(keys + ["trip_key"])
                .agg(arrival=("Gate_entry_time", "min"),
                     slot_dt=("slot_dt", "first"),
                     received=("Received_qty", "sum"))
@@ -86,7 +90,7 @@ def planned_qty(df: pd.DataFrame, split_loc: bool) -> pd.DataFrame:
 
 
 def slot_days(trips: pd.DataFrame, keys) -> pd.DataFrame:
-    return trips.groupby(keys).agg(trips=("truck_key", "nunique")).reset_index()
+    return trips.groupby(keys).agg(trips=("trip_key", "nunique")).reset_index()
 
 
 def trip_plan(sd: pd.DataFrame, group_cols, lo, plan_q) -> pd.DataFrame:
@@ -130,18 +134,18 @@ def build_lines(df: pd.DataFrame) -> pd.DataFrame:
     (e.g. '10/15 5/15'); empty when the line came in one truck."""
     keys = ["Nag_date", "Supply_Time", "unloading_loc", "Schedule_no", "Item",
             "Item_name"]
-    tl = (df.groupby(keys + ["truck_key"])
+    tl = (df.groupby(keys + ["trip_key"])
             .agg(received=("Received_qty", "sum"), entry=("Gate_entry_time", "min"),
                  planned=("Nag_qty", "first"), vendor=("Vendor_code", "first"))
             .reset_index().sort_values(keys + ["entry"]))
-    tl["n"] = tl.groupby(keys)["truck_key"].transform("size")
+    tl["n"] = tl.groupby(keys)["trip_key"].transform("size")
     part = tl["received"].map(_num)
     den = tl["planned"].map(lambda v: "" if pd.isna(v) else "/" + _num(v))
     tl["part"] = part + den
     parts = (tl[tl["n"] > 1].groupby(keys)["part"].agg(" ".join).rename("parts"))
     lines = (tl.groupby(keys)
                .agg(planned=("planned", "first"), received=("received", "sum"),
-                    trucks=("truck_key", "nunique"), first_entry=("entry", "min"),
+                    trucks=("trip_key", "nunique"), first_entry=("entry", "min"),
                     last_entry=("entry", "max"), vendor=("vendor", "first"))
                .reset_index().merge(parts, on=keys, how="left"))
     lines["parts"] = lines["parts"].fillna("")
@@ -202,7 +206,7 @@ def arrival_by_bucket(df: pd.DataFrame, bucket_min: int, plan_q: float,
                       weekdays=None) -> pd.DataFrame:
     """Trucks entering the gate per clock bucket, per gate date, zero-filled."""
     a = (df.dropna(subset=["Gate_entry_time"])
-           .drop_duplicates(["truck_key", "Gate_entry_time"]))
+           .drop_duplicates(["trip_key", "Gate_entry_time"]))
     if a.empty:
         return pd.DataFrame()
     a = a.assign(gdate=a["Gate_entry_time"].dt.normalize(),
@@ -226,7 +230,7 @@ def arrival_by_bucket(df: pd.DataFrame, bucket_min: int, plan_q: float,
 
 def daily_features(trips: pd.DataFrame, plan: pd.DataFrame) -> pd.DataFrame:
     d = (trips.groupby("Nag_date")
-              .agg(trips=("truck_key", "size")).reset_index())
+              .agg(trips=("trip_key", "size")).reset_index())
     q = plan.groupby("Nag_date")["planned_qty"].sum().reset_index()
     d = d.merge(q, on="Nag_date", how="left")
     # calendar days with no trucks at all are real zero-trip days
@@ -355,7 +359,8 @@ def main():
     n_days = (df["Nag_date"].max() - df["Nag_date"].min()).days + 1
 
     st.caption(f"{df['Nag_date'].min():%d-%b-%Y} to {df['Nag_date'].max():%d-%b-%Y} "
-               f"({n_days} days). A trip is one truck per day + supply time"
+               f"({n_days} days). A trip is one gate entry per day + supply time (a truck "
+               "coming back later counts again)"
                f"{' + location' if split_loc else ''}. Supply time is the scheduled "
                "slot; gate entry is when the truck really came.")
     if n_days < 150:
