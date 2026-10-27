@@ -321,7 +321,8 @@ def main():
                               sorted(base["unloading_loc"].unique()))
         vendors = st.multiselect("Vendor",
                                  sorted(base["Vendor_code"].unique()))
-        split_loc = st.checkbox("Treat each location as its own slot", value=False)
+        split_loc = st.checkbox("Also show bay (unloading location) breakdown", value=False,
+                                help="One gate entry can unload at several bays. Trips are always counted once per gate entry; this only adds bay-visit and per-bay material tables.")
         lo, plan_q = st.select_slider("Min case / Plan-for percentile",
                                       options=[0.05, 0.10, 0.20, 0.50, 0.75, 0.80, 0.85,
                                                0.90, 0.95],
@@ -350,10 +351,12 @@ def main():
 
     lines, iday = frames(path, dr, tuple(locs), tuple(vendors))
     wd = [WEEKDAYS.index(w) for w in plan_days]
-    slot_keys = ["Supply_Time"] + (["unloading_loc"] if split_loc else [])
+    slot_keys = ["Supply_Time"]
+    mat_keys = slot_keys + (["unloading_loc"] if split_loc else [])
 
-    trips = build_trips(df, split_loc)
-    plan = planned_qty(df, split_loc)
+    # Trips are gate entries, counted once however many bays the truck visits
+    trips = build_trips(df, False)
+    plan = planned_qty(df, False)
     sd = slot_days(trips, ["Nag_date"] + slot_keys)
     sd["weekday"] = sd["Nag_date"].dt.dayofweek.map(dict(enumerate(WEEKDAYS)))
     n_days = (df["Nag_date"].max() - df["Nag_date"].min()).days + 1
@@ -361,7 +364,7 @@ def main():
     st.caption(f"{df['Nag_date'].min():%d-%b-%Y} to {df['Nag_date'].max():%d-%b-%Y} "
                f"({n_days} days). A trip is one gate entry per day + supply time (a truck "
                "coming back later counts again)"
-               f"{' + location' if split_loc else ''}. Supply time is the scheduled "
+               ". Supply time is the scheduled "
                "slot; gate entry is when the truck really came.")
     if n_days < 150:
         st.warning("Less than ~5 months of data in range: seasonality and "
@@ -371,9 +374,18 @@ def main():
     table = trip_plan(sd, slot_keys, lo, plan_q)
     table["Runs on % of days"] = (100 * table["Days run"] / n_days).round().astype(int)
     aw = arrival_window(trips, slot_keys, *win)
-    mats = slot_materials(iday, slot_keys, core)
+    mats = slot_materials(iday, mat_keys, core)
     by_hour = arrival_by_bucket(df, bucket, plan_q)
     d = daily_features(trips, plan)
+    bay_table = pd.DataFrame()
+    bays_per_trip = None
+    if split_loc:
+        bay_sd = slot_days(build_trips(df, True), ["Nag_date"] + mat_keys)
+        bay_table = trip_plan(bay_sd, mat_keys, lo, plan_q).rename(
+            columns={"Min": "Min bay visits", "Typical": "Typical bay visits",
+                     "Plan for": "Plan for bay visits", "Max seen": "Max bay visits"})
+        bays_per_trip = (df.groupby(["Nag_date", "Supply_Time", "trip_key"])
+                           ["unloading_loc"].nunique().mean())
 
     # ---- Plan (the answer) --------------------------------------------------
     h_sd = sd if not wd else sd[sd["Nag_date"].dt.dayofweek.isin(wd)]
@@ -381,7 +393,7 @@ def main():
     h_trips = trips if not wd else trips[trips["Nag_date"].dt.dayofweek.isin(wd)]
     p_slots = trip_plan(h_sd, slot_keys, lo, plan_q)
     p_aw = arrival_window(h_trips, slot_keys, *win)
-    p_mats = slot_materials(h_iday, slot_keys, core)
+    p_mats = slot_materials(h_iday, mat_keys, core)
     p_hour = arrival_by_bucket(df, bucket, plan_q, wd)
 
     if p_slots.empty:
@@ -439,6 +451,14 @@ def main():
         st.caption(f"Min = P{int(lo*100)}, Plan for = P{int(plan_q*100)} of trips on "
                    "days the slot actually ran. Check 'Runs on % of days' before "
                    "staffing a slot that only runs occasionally.")
+        if split_loc:
+            st.subheader("Bay visits per slot")
+            st.metric("Average bays visited per gate entry", f"{bays_per_trip:.1f}")
+            st.dataframe(bay_table.sort_values(mat_keys), hide_index=True,
+                         width="stretch")
+            st.caption("A bay visit is one gate entry unloading at that bay. One truck "
+                       "can visit several bays, so these do NOT add up to trips; use "
+                       "them to size bay and unloading capacity, not truck count.")
         wk = (sd.groupby(slot_keys + ["weekday"])["trips"].median().round()
                 .unstack("weekday"))
         wk = wk.reindex(columns=[w for w in WEEKDAYS if w in wk.columns]).reset_index()
@@ -509,6 +529,7 @@ def main():
         to_excel({"Plan": plan_view, "Plan arrivals by hour": p_hour,
                   "Plan materials": p_mats, "Trips per slot": table,
                   "Arrival window": aw, "Materials per slot": mats,
+                  **({"Bay visits": bay_table} if split_loc else {}),
                   "Line detail": detail, "Daily": d.assign(Nag_date=d["Nag_date"].dt.date)}),
         file_name=f"trip_demand_{df['Nag_date'].max():%Y%m%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
