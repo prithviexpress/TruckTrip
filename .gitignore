@@ -1,0 +1,8 @@
+# Plant data stays local, never in git
+*.parquet
+*.xlsx
+*.csv
+data/
+__pycache__/
+.venv/
+.streamlit/secrets.toml
