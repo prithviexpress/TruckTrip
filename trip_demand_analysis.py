@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 DEFAULT_PATH = "nagare_data.parquet"
-COLS = ["Schedule_no", "Item", "Vendor_code", "unloading_loc", "Nag_date",
+COLS = ["Schedule_no", "Item", "Item_name", "Vendor_code", "unloading_loc", "Nag_date",
         "Supply_Time", "Nag_qty", "Received_qty", "Truck_number",
         "Consignement_no", "Gate_entry_time"]
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -38,6 +38,9 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
                                            errors="coerce")
     df["Supply_Time"] = df["Supply_Time"].astype(str).str.strip().str.slice(0, 5)
     df["unloading_loc"] = df["unloading_loc"].fillna("").astype(str).str.strip()
+    df["Item"] = df["Item"].fillna("").astype(str).str.strip()
+    df["Item_name"] = df["Item_name"].fillna("").astype(str).str.strip()
+    df["Vendor_code"] = df["Vendor_code"].fillna("").astype(str).str.strip()
     for c in ("Nag_qty", "Received_qty"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["truck_key"] = df["Truck_number"].astype("string").fillna(
@@ -111,6 +114,35 @@ def arrival_window(trips: pd.DataFrame, group_cols, lo, hi) -> pd.DataFrame:
                      "% before slot": round(100 * (o <= 0).mean()),
                      "% >60 min late": round(100 * (o > 60).mean())})
     return pd.DataFrame(rows)
+
+
+def slot_materials(df: pd.DataFrame, slot_keys, core_pct) -> pd.DataFrame:
+    """What arrives in each slot: per slot x item, how often it shows up and
+    how much / how many trucks it brings on the days it does."""
+    day = (df.groupby(slot_keys + ["Item", "Item_name", "Nag_date"])
+             .agg(qty=("Received_qty", "sum"), trucks=("truck_key", "nunique"),
+                  vendors=("Vendor_code", lambda v: ", ".join(sorted(set(v)))[:40]))
+             .reset_index())
+    run_days = df.groupby(slot_keys)["Nag_date"].nunique().rename("slot_days")
+    rows = []
+    for g, s in day.groupby(slot_keys + ["Item", "Item_name"]):
+        n = s["Nag_date"].nunique()
+        rows.append({**dict(zip(slot_keys + ["Item", "Item_name"], g)),
+                     "Vendors": ", ".join(sorted({x for v in s["vendors"]
+                                                  for x in v.split(", ") if x}))[:40],
+                     "Days seen": n,
+                     "Qty/day median": round(s["qty"].median()),
+                     "Qty/day P90": round(s["qty"].quantile(0.9)),
+                     "Trucks/day median": int(round(s["trucks"].median())),
+                     "Total qty": round(s["qty"].sum())})
+    out = pd.DataFrame(rows).merge(run_days.reset_index(), on=slot_keys)
+    out["% of slot days"] = (100 * out["Days seen"] / out["slot_days"]).round().astype(int)
+    out["Share of slot qty %"] = (100 * out["Total qty"] / out.groupby(slot_keys)
+                                  ["Total qty"].transform("sum")).round(1)
+    out["Core item"] = np.where(out["% of slot days"] >= core_pct, "yes", "")
+    return (out.drop(columns=["slot_days", "Total qty"])
+               .sort_values(slot_keys + ["Days seen"], ascending=[True] * len(slot_keys)
+                            + [False]).reset_index(drop=True))
 
 
 def daily_features(trips: pd.DataFrame, plan: pd.DataFrame) -> pd.DataFrame:
@@ -233,8 +265,8 @@ def main():
         st.warning("Less than ~5 months of data: seasonality and month-end effects "
                    "are unreliable.")
 
-    t1, t2, t3 = st.tabs(["1. Trips per supply time", "2. Arrival window",
-                          "3. What drives trips up"])
+    t1, t2, t4, t3 = st.tabs(["1. Trips per supply time", "2. Arrival window",
+                              "3. Materials per slot", "4. What drives trips up"])
 
     with t1:
         table = trip_plan(sd, slot_keys, lo, plan_q)
@@ -258,6 +290,19 @@ def main():
         h = trips["arrival"].dt.hour.value_counts().sort_index()
         st.subheader("Gate entries by hour of day")
         st.bar_chart(h.rename("Trucks"))
+
+    with t4:
+        core = st.slider("Core item = seen on at least this % of the slot's days",
+                         10, 100, 50, step=5)
+        mats = slot_materials(df, slot_keys, core)
+        pick = st.selectbox("Supply time", ["All"] + sorted(mats["Supply_Time"].unique()))
+        view = mats if pick == "All" else mats[mats["Supply_Time"] == pick]
+        if pick != "All":
+            st.metric("Core items expected", int((view["Core item"] == "yes").sum()))
+        st.dataframe(view, hide_index=True, width="stretch")
+        st.caption("Qty = Received_qty summed per day, on days the item came in that "
+                   "slot. Trucks/day counts trucks carrying the item, and one truck "
+                   "can carry several items, so don't add this column across items.")
 
     with t3:
         d = daily_features(trips, plan)
@@ -286,7 +331,7 @@ def main():
     st.divider()
     st.download_button(
         "Download Excel",
-        to_excel({"Trips per slot": table, "Arrival window": aw,
+        to_excel({"Trips per slot": table, "Arrival window": aw, "Materials per slot": mats,
                   "Daily": d.assign(Nag_date=d["Nag_date"].dt.date)}),
         file_name=f"trip_demand_{df['Nag_date'].max():%Y%m%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
