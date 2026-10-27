@@ -16,6 +16,7 @@ Run:      streamlit run trip_demand_analysis.py
 import io
 import math
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -227,6 +228,50 @@ def item_bays(df: pd.DataFrame) -> pd.DataFrame:
         rows.append({"Supply_Time": slot, "Item": item,
                      "Bays (% of days)": _share_text(100 * at.loc[(slot, item)] / n)})
     return pd.DataFrame(rows)
+
+
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300",
+          "#6250d6", "#e34948"]     # fixed categorical order, one colour per slot
+
+
+def gate_scatter(trips: pd.DataFrame, slots: list):
+    """Every gate entry as a dot (date x clock time), one colour per supply
+    slot, a solid line at the slot's median entry time and a dashed line at
+    its supply time."""
+    t = trips[trips["Supply_Time"].isin(slots)].dropna(subset=["arrival"])
+    t = t[t["offset_min"].between(-MAX_EARLY_H * 60, MAX_LATE_H * 60)].copy()
+    if t.empty:
+        return None, pd.DataFrame()
+    t["hours"] = (t["arrival"] - t["Nag_date"]).dt.total_seconds() / 3600
+    t["Gate entry"] = t["arrival"].dt.strftime("%d-%b %H:%M")
+    t["Minutes vs slot"] = t["offset_min"].round().astype(int)
+    meds = (t.groupby("Supply_Time")
+              .agg(median=("hours", "median"), n=("hours", "size")).reset_index())
+    meds["Median entry"] = [slot_clock(r.Supply_Time,
+                                       (r.median * 60) - _slot_min(r.Supply_Time))
+                            for r in meds.itertuples()]
+    meds["slot_hours"] = meds["Supply_Time"].map(lambda x: _slot_min(x) / 60)
+    order = sorted(slots)
+    colour = alt.Color("Supply_Time:N", title="Supply time",
+                       scale=alt.Scale(domain=order, range=SERIES[:len(order)]))
+    y = alt.Y("hours:Q", title="Gate entry (clock time)",
+              scale=alt.Scale(zero=False, nice=True),
+              axis=alt.Axis(tickMinStep=1, grid=True, gridOpacity=0.25,
+                            labelExpr="(((datum.value % 24) + 24) % 24 < 10 ? '0' : '')"
+                                      " + floor(((datum.value % 24) + 24) % 24) + ':00'"))
+    dots = alt.Chart(t).mark_circle(size=30, opacity=0.35).encode(
+        x=alt.X("Nag_date:T", title="Supply date"), y=y, color=colour,
+        tooltip=["Supply_Time", "Gate entry", "Minutes vs slot", "trip_key"])
+    median = alt.Chart(meds).mark_rule(strokeWidth=3).encode(
+        y="median:Q", color=colour, tooltip=["Supply_Time", "Median entry", "n"])
+    supply = alt.Chart(meds).mark_rule(strokeDash=[4, 4], opacity=0.55, color="gray") \
+        .encode(y="slot_hours:Q", tooltip=["Supply_Time"])
+    return (supply + dots + median).properties(height=380), meds
+
+
+def _slot_min(slot: str) -> int:
+    h, m = map(int, slot.split(":"))
+    return h * 60 + m
 
 
 def slot_clock(slot: str, minutes: float) -> str:
@@ -508,6 +553,23 @@ def main():
         st.dataframe(wk, hide_index=True, width="stretch")
 
     with t2:
+        slots_all = sorted(trips["Supply_Time"].unique())
+        pick_s = st.selectbox("Supply time to plot",
+                              ["All slots"] + slots_all,
+                              index=0 if len(slots_all) <= 4 else 1)
+        chosen = slots_all if pick_s == "All slots" else [pick_s]
+        if len(chosen) > len(SERIES):
+            st.info(f"More than {len(SERIES)} slots: pick one to plot.")
+        else:
+            chart, meds = gate_scatter(trips, chosen)
+            if chart is None:
+                st.info("No gate entries to plot.")
+            else:
+                st.altair_chart(chart, width="stretch")
+                st.caption("Each dot is one gate entry. Solid line = median entry "
+                           "time, dashed grey line = supply time. "
+                           + "  ".join(f"{r.Supply_Time}: median {r._4} (n={r.n})"
+                                       for r in meds.itertuples()))
         st.dataframe(aw.sort_values(slot_keys), hide_index=True, width="stretch")
         st.caption("Minutes relative to supply time (negative = early), first gate "
                    f"entry of each truck. Arrivals beyond {MAX_EARLY_H}h early or "
