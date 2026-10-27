@@ -1,10 +1,13 @@
 """
 Trip Demand Analysis
 --------------------
-Answers three planning questions from nagare_data.parquet:
-  1. How many trips to plan per supply time (min / typical / plan-for)
-  2. When trucks actually arrive relative to the supply time
-  3. What conditions push trip counts up (weekday, month position, planned qty)
+Answers the planning questions from nagare_data.parquet:
+  * Plan: trips to plan per supply time, when those trucks really arrive
+    (gate entry), and which materials to expect, with part-deliveries as 10/15 5/15
+  * Trips per supply time (min / typical / plan-for)
+  * Arrival: gate entry vs supply time, and trucks per clock-hour at the gate
+  * Materials per slot, and day detail with part-deliveries
+  * What conditions push trip counts up (weekday, month position, planned qty)
 
 Install:  pip install streamlit pandas pyarrow openpyxl numpy
 Run:      streamlit run trip_demand_analysis.py
@@ -38,6 +41,7 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
                                            errors="coerce")
     df["Supply_Time"] = df["Supply_Time"].astype(str).str.strip().str.slice(0, 5)
     df["unloading_loc"] = df["unloading_loc"].fillna("").astype(str).str.strip()
+    df["Schedule_no"] = df["Schedule_no"].fillna("").astype(str).str.strip()
     df["Item"] = df["Item"].fillna("").astype(str).str.strip()
     df["Item_name"] = df["Item_name"].fillna("").astype(str).str.strip()
     df["Vendor_code"] = df["Vendor_code"].fillna("").astype(str).str.strip()
@@ -116,25 +120,66 @@ def arrival_window(trips: pd.DataFrame, group_cols, lo, hi) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def slot_materials(df: pd.DataFrame, slot_keys, core_pct) -> pd.DataFrame:
-    """What arrives in each slot: per slot x item, how often it shows up and
-    how much / how many trucks it brings on the days it does."""
-    day = (df.groupby(slot_keys + ["Item", "Item_name", "Nag_date"])
-             .agg(qty=("Received_qty", "sum"), trucks=("truck_key", "nunique"),
-                  vendors=("Vendor_code", lambda v: ", ".join(sorted(set(v)))[:40]))
-             .reset_index())
-    run_days = df.groupby(slot_keys)["Nag_date"].nunique().rename("slot_days")
+def _num(v):
+    return f"{v:g}"
+
+
+def build_lines(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per schedule line (Schedule_no + Item on a day + slot).
+    Parts = what each truck brought, in gate-entry order, as received/planned
+    (e.g. '10/15 5/15'); empty when the line came in one truck."""
+    keys = ["Nag_date", "Supply_Time", "unloading_loc", "Schedule_no", "Item",
+            "Item_name"]
+    tl = (df.groupby(keys + ["truck_key"])
+            .agg(received=("Received_qty", "sum"), entry=("Gate_entry_time", "min"),
+                 planned=("Nag_qty", "first"), vendor=("Vendor_code", "first"))
+            .reset_index().sort_values(keys + ["entry"]))
+    tl["n"] = tl.groupby(keys)["truck_key"].transform("size")
+    part = tl["received"].map(_num)
+    den = tl["planned"].map(lambda v: "" if pd.isna(v) else "/" + _num(v))
+    tl["part"] = part + den
+    parts = (tl[tl["n"] > 1].groupby(keys)["part"].agg(" ".join).rename("parts"))
+    lines = (tl.groupby(keys)
+               .agg(planned=("planned", "first"), received=("received", "sum"),
+                    trucks=("truck_key", "nunique"), first_entry=("entry", "min"),
+                    last_entry=("entry", "max"), vendor=("vendor", "first"))
+               .reset_index().merge(parts, on=keys, how="left"))
+    lines["parts"] = lines["parts"].fillna("")
+    return lines
+
+
+def build_item_days(lines: pd.DataFrame) -> pd.DataFrame:
+    """One row per item per day + slot (lines of the same item merged)."""
+    keys = ["Nag_date", "Supply_Time", "unloading_loc", "Item", "Item_name"]
+    return (lines.groupby(keys)
+                 .agg(planned=("planned", "sum"), received=("received", "sum"),
+                      trucks=("trucks", "sum"),
+                      vendors=("vendor", lambda v: ", ".join(sorted(set(v)))[:40]),
+                      parts=("parts", lambda p: "; ".join(x for x in p if x)),
+                      first_entry=("first_entry", "min"))
+                 .reset_index())
+
+
+def slot_materials(iday: pd.DataFrame, slot_keys, core_pct) -> pd.DataFrame:
+    """What arrives in each slot: per slot x item, how often it shows up, how
+    much it brings, and how often it comes in parts."""
+    run_days = iday.groupby(slot_keys)["Nag_date"].nunique().rename("slot_days")
+    gk = slot_keys + ["Item", "Item_name"]
     rows = []
-    for g, s in day.groupby(slot_keys + ["Item", "Item_name"]):
-        n = s["Nag_date"].nunique()
-        rows.append({**dict(zip(slot_keys + ["Item", "Item_name"], g)),
+    for g, s in iday.groupby(gk):
+        split = s[s["parts"] != ""].sort_values("Nag_date")
+        last = (f"{split['parts'].iloc[-1]} ({split['Nag_date'].iloc[-1]:%d-%b})"
+                if len(split) else "")
+        rows.append({**dict(zip(gk, g)),
                      "Vendors": ", ".join(sorted({x for v in s["vendors"]
                                                   for x in v.split(", ") if x}))[:40],
-                     "Days seen": n,
-                     "Qty/day median": round(s["qty"].median()),
-                     "Qty/day P90": round(s["qty"].quantile(0.9)),
-                     "Trucks/day median": int(round(s["trucks"].median())),
-                     "Total qty": round(s["qty"].sum())})
+                     "Days seen": len(s),
+                     "Qty/day median": round(s["received"].median()),
+                     "Qty/day P90": round(s["received"].quantile(0.9)),
+                     "Typical parts": int(round(s["trucks"].median())),
+                     "Came in parts %": round(100 * len(split) / len(s)),
+                     "Last split seen": last,
+                     "Total qty": round(s["received"].sum())})
     out = pd.DataFrame(rows).merge(run_days.reset_index(), on=slot_keys)
     out["% of slot days"] = (100 * out["Days seen"] / out["slot_days"]).round().astype(int)
     out["Share of slot qty %"] = (100 * out["Total qty"] / out.groupby(slot_keys)
@@ -143,6 +188,40 @@ def slot_materials(df: pd.DataFrame, slot_keys, core_pct) -> pd.DataFrame:
     return (out.drop(columns=["slot_days", "Total qty"])
                .sort_values(slot_keys + ["Days seen"], ascending=[True] * len(slot_keys)
                             + [False]).reset_index(drop=True))
+
+
+def slot_clock(slot: str, minutes: float) -> str:
+    """Clock time = supply time + offset, flagged when it rolls to another day."""
+    h, m = map(int, slot.split(":"))
+    t = h * 60 + m + int(round(minutes))
+    day, t = divmod(t, 1440)
+    return f"{t // 60:02d}:{t % 60:02d}" + (f" ({day:+d}d)" if day else "")
+
+
+def arrival_by_bucket(df: pd.DataFrame, bucket_min: int, plan_q: float,
+                      weekdays=None) -> pd.DataFrame:
+    """Trucks entering the gate per clock bucket, per gate date, zero-filled."""
+    a = (df.dropna(subset=["Gate_entry_time"])
+           .drop_duplicates(["truck_key", "Gate_entry_time"]))
+    if a.empty:
+        return pd.DataFrame()
+    a = a.assign(gdate=a["Gate_entry_time"].dt.normalize(),
+                 bucket=a["Gate_entry_time"].dt.floor(f"{bucket_min}min")
+                          .dt.strftime("%H:%M"))
+    cnt = a.groupby(["gdate", "bucket"]).size().unstack("bucket", fill_value=0)
+    cnt = cnt.reindex(pd.date_range(cnt.index.min(), cnt.index.max(), freq="D"),
+                      fill_value=0)
+    if weekdays:
+        cnt = cnt[cnt.index.dayofweek.isin(weekdays)]
+    rows = []
+    for b in sorted(cnt.columns):
+        c = cnt[b]
+        rows.append({"Gate entry from": b, "Days": len(c),
+                     "Typical trucks": int(round(c.median())),
+                     "Plan for": math.ceil(c.quantile(plan_q)),
+                     "Max seen": int(c.max()),
+                     "Days with trucks %": round(100 * (c > 0).mean())})
+    return pd.DataFrame(rows)
 
 
 def daily_features(trips: pd.DataFrame, plan: pd.DataFrame) -> pd.DataFrame:
@@ -228,10 +307,16 @@ def main():
         except Exception as e:
             st.error(f"Could not read {path}: {e}")
             st.stop()
+        dmin, dmax = base["Nag_date"].min().date(), base["Nag_date"].max().date()
+        dr = st.date_input("Date range (Nag_date)", value=(dmin, dmax),
+                           min_value=dmin, max_value=dmax)
+        if len(dr) != 2:
+            st.info("Pick an end date.")
+            st.stop()
         locs = st.multiselect("Unloading location",
                               sorted(base["unloading_loc"].unique()))
         vendors = st.multiselect("Vendor",
-                                 sorted(base["Vendor_code"].dropna().astype(str).unique()))
+                                 sorted(base["Vendor_code"].unique()))
         split_loc = st.checkbox("Treat each location as its own slot", value=False)
         lo, plan_q = st.select_slider("Min case / Plan-for percentile",
                                       options=[0.05, 0.10, 0.20, 0.50, 0.75, 0.80, 0.85,
@@ -241,36 +326,110 @@ def main():
         win = st.select_slider("Arrival window percentiles",
                                options=[0.05, 0.10, 0.20, 0.80, 0.90, 0.95],
                                value=(0.10, 0.90))
+        bucket = st.select_slider("Gate-entry bucket (minutes)",
+                                  options=[30, 60, 120], value=60)
+        core = st.slider("Core item = seen on at least this % of the slot's days",
+                         10, 100, 50, step=5)
+        plan_days = st.multiselect("Plan for weekday(s)", WEEKDAYS,
+                                   help="Plan tab uses only history from these "
+                                        "weekdays. Empty = all days.")
 
-    df = base
+    df = base[(base["Nag_date"] >= pd.Timestamp(dr[0]))
+              & (base["Nag_date"] <= pd.Timestamp(dr[1]))]
     if locs:
         df = df[df["unloading_loc"].isin(locs)]
     if vendors:
-        df = df[df["Vendor_code"].astype(str).isin(vendors)]
+        df = df[df["Vendor_code"].isin(vendors)]
     if df.empty:
         st.info("No data for these filters.")
         st.stop()
 
+    lines, iday = frames(path, dr, tuple(locs), tuple(vendors))
+    wd = [WEEKDAYS.index(w) for w in plan_days]
+    slot_keys = ["Supply_Time"] + (["unloading_loc"] if split_loc else [])
+
     trips = build_trips(df, split_loc)
     plan = planned_qty(df, split_loc)
-    slot_keys = ["Supply_Time"] + (["unloading_loc"] if split_loc else [])
     sd = slot_days(trips, ["Nag_date"] + slot_keys)
     sd["weekday"] = sd["Nag_date"].dt.dayofweek.map(dict(enumerate(WEEKDAYS)))
     n_days = (df["Nag_date"].max() - df["Nag_date"].min()).days + 1
 
     st.caption(f"{df['Nag_date'].min():%d-%b-%Y} to {df['Nag_date'].max():%d-%b-%Y} "
                f"({n_days} days). A trip is one truck per day + supply time"
-               f"{' + location' if split_loc else ''}.")
+               f"{' + location' if split_loc else ''}. Supply time is the scheduled "
+               "slot; gate entry is when the truck really came.")
     if n_days < 150:
-        st.warning("Less than ~5 months of data: seasonality and month-end effects "
-                   "are unreliable.")
+        st.warning("Less than ~5 months of data in range: seasonality and "
+                   "month-end effects are unreliable.")
 
-    t1, t2, t4, t3 = st.tabs(["1. Trips per supply time", "2. Arrival window",
-                              "3. Materials per slot", "4. What drives trips up"])
+    # ---- shared tables ------------------------------------------------------
+    table = trip_plan(sd, slot_keys, lo, plan_q)
+    table["Runs on % of days"] = (100 * table["Days run"] / n_days).round().astype(int)
+    aw = arrival_window(trips, slot_keys, *win)
+    mats = slot_materials(iday, slot_keys, core)
+    by_hour = arrival_by_bucket(df, bucket, plan_q)
+    d = daily_features(trips, plan)
+
+    # ---- Plan (the answer) --------------------------------------------------
+    h_sd = sd if not wd else sd[sd["Nag_date"].dt.dayofweek.isin(wd)]
+    h_iday = iday if not wd else iday[iday["Nag_date"].dt.dayofweek.isin(wd)]
+    h_trips = trips if not wd else trips[trips["Nag_date"].dt.dayofweek.isin(wd)]
+    p_slots = trip_plan(h_sd, slot_keys, lo, plan_q)
+    p_aw = arrival_window(h_trips, slot_keys, *win)
+    p_mats = slot_materials(h_iday, slot_keys, core)
+    p_hour = arrival_by_bucket(df, bucket, plan_q, wd)
+
+    if p_slots.empty:
+        plan_view = pd.DataFrame()
+    else:
+        plan_view = p_slots.merge(p_aw, on=slot_keys, how="left")
+        plan_view["Gate entry from"] = [
+            slot_clock(r["Supply_Time"], r["Early edge (min)"])
+            if pd.notna(r["Early edge (min)"]) else "" for _, r in plan_view.iterrows()]
+        plan_view["Median gate entry"] = [
+            slot_clock(r["Supply_Time"], r["Median (min)"])
+            if pd.notna(r["Median (min)"]) else "" for _, r in plan_view.iterrows()]
+        plan_view["Gate entry by"] = [
+            slot_clock(r["Supply_Time"], r["Late edge (min)"])
+            if pd.notna(r["Late edge (min)"]) else "" for _, r in plan_view.iterrows()]
+        plan_view = plan_view[slot_keys + ["Plan for", "Typical", "Min", "Max seen",
+                                           "Days run", "Gate entry from",
+                                           "Median gate entry", "Gate entry by"]]
+        plan_view = plan_view.rename(columns={"Plan for": "Trips to plan"})
+
+    tp, t1, t2, t4, t5, t3 = st.tabs(
+        ["PLAN", "Trips per supply time", "Gate entry vs supply time",
+         "Materials per slot", "Day detail", "What drives trips up"])
+
+    with tp:
+        who = "all days" if not wd else "/".join(plan_days)
+        daily_tot = h_sd.groupby("Nag_date")["trips"].sum()
+        if wd:
+            full = pd.date_range(dr[0], dr[1], freq="D")
+            full = full[full.dayofweek.isin(wd)]
+            daily_tot = daily_tot.reindex(full, fill_value=0)
+        c1, c2, c3 = st.columns(3)
+        c1.metric(f"Trips on a typical day ({who})", int(round(daily_tot.median())))
+        c2.metric(f"Trips to plan (P{int(plan_q*100)} of days)",
+                  math.ceil(daily_tot.quantile(plan_q)))
+        c3.metric("Busiest day seen", int(daily_tot.max()))
+        st.subheader("1. Trips to plan, and when they actually arrive")
+        st.dataframe(plan_view.sort_values(slot_keys), hide_index=True, width="stretch")
+        st.caption("Trips to plan = trucks covered on that share of days the slot ran. "
+                   "Gate entry columns are clock times from real gate-entry history "
+                   "relative to the slot; (+1d) means after midnight. Slot totals "
+                   "overstate the day total because slots rarely all peak together.")
+        st.subheader("2. Trucks to expect at the gate by clock time")
+        st.dataframe(p_hour[p_hour["Max seen"] > 0], hide_index=True, width="stretch")
+        st.subheader("3. Materials to expect")
+        only_core = st.checkbox("Core items only", value=True)
+        pm = p_mats[p_mats["Core item"] == "yes"] if only_core else p_mats
+        st.dataframe(pm.drop(columns=["Core item"]), hide_index=True, width="stretch")
+        st.caption("Came in parts % = share of days the item arrived on more than one "
+                   "truck. Last split seen is received/planned per truck in gate "
+                   "order, e.g. 10/15 5/15.")
 
     with t1:
-        table = trip_plan(sd, slot_keys, lo, plan_q)
-        table["Runs on % of days"] = (100 * table["Days run"] / n_days).round().astype(int)
         st.dataframe(table.sort_values(slot_keys), hide_index=True, width="stretch")
         st.caption(f"Min = P{int(lo*100)}, Plan for = P{int(plan_q*100)} of trips on "
                    "days the slot actually ran. Check 'Runs on % of days' before "
@@ -282,30 +441,40 @@ def main():
         st.dataframe(wk, hide_index=True, width="stretch")
 
     with t2:
-        aw = arrival_window(trips, slot_keys, *win)
         st.dataframe(aw.sort_values(slot_keys), hide_index=True, width="stretch")
         st.caption("Minutes relative to supply time (negative = early), first gate "
                    f"entry of each truck. Arrivals beyond {MAX_EARLY_H}h early or "
                    f"{MAX_LATE_H}h late are dropped as likely mismatches.")
-        h = trips["arrival"].dt.hour.value_counts().sort_index()
-        st.subheader("Gate entries by hour of day")
-        st.bar_chart(h.rename("Trucks"))
+        st.subheader("Trucks per gate-entry bucket (all days, zero days included)")
+        st.dataframe(by_hour, hide_index=True, width="stretch")
+        if not by_hour.empty:
+            st.bar_chart(by_hour.set_index("Gate entry from")["Typical trucks"])
 
     with t4:
-        core = st.slider("Core item = seen on at least this % of the slot's days",
-                         10, 100, 50, step=5)
-        mats = slot_materials(df, slot_keys, core)
         pick = st.selectbox("Supply time", ["All"] + sorted(mats["Supply_Time"].unique()))
         view = mats if pick == "All" else mats[mats["Supply_Time"] == pick]
         if pick != "All":
             st.metric("Core items expected", int((view["Core item"] == "yes").sum()))
         st.dataframe(view, hide_index=True, width="stretch")
         st.caption("Qty = Received_qty summed per day, on days the item came in that "
-                   "slot. Trucks/day counts trucks carrying the item, and one truck "
-                   "can carry several items, so don't add this column across items.")
+                   "slot. Typical parts = trucks carrying the item on a normal day; "
+                   "one truck can carry several items, so don't add across items.")
+
+    with t5:
+        days = sorted(lines["Nag_date"].dt.date.unique())
+        day = st.selectbox("Day", days, index=len(days) - 1)
+        dl = lines[lines["Nag_date"].dt.date == day].sort_values(
+            ["Supply_Time", "first_entry"])
+        dl = dl.rename(columns={"Supply_Time": "Supply time", "planned": "Planned",
+                                "received": "Received", "trucks": "Trucks",
+                                "first_entry": "First gate entry",
+                                "last_entry": "Last gate entry", "parts": "Parts",
+                                "vendor": "Vendor"})
+        st.dataframe(dl.drop(columns=["Nag_date", "Schedule_no"]), hide_index=True,
+                     width="stretch")
+        st.caption("Parts = received/planned per truck, in gate-entry order.")
 
     with t3:
-        d = daily_features(trips, plan)
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("By weekday")
@@ -329,12 +498,27 @@ def main():
             st.info("Not enough days with planned quantity for a combined fit.")
 
     st.divider()
+    detail = lines.assign(Nag_date=lines["Nag_date"].dt.date)
     st.download_button(
         "Download Excel",
-        to_excel({"Trips per slot": table, "Arrival window": aw, "Materials per slot": mats,
-                  "Daily": d.assign(Nag_date=d["Nag_date"].dt.date)}),
+        to_excel({"Plan": plan_view, "Plan arrivals by hour": p_hour,
+                  "Plan materials": p_mats, "Trips per slot": table,
+                  "Arrival window": aw, "Materials per slot": mats,
+                  "Line detail": detail, "Daily": d.assign(Nag_date=d["Nag_date"].dt.date)}),
         file_name=f"trip_demand_{df['Nag_date'].max():%Y%m%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@st.cache_resource(show_spinner="Building schedule lines…")
+def frames(path, dr, locs, vendors):
+    df = load(path)
+    df = df[(df["Nag_date"] >= pd.Timestamp(dr[0])) & (df["Nag_date"] <= pd.Timestamp(dr[1]))]
+    if locs:
+        df = df[df["unloading_loc"].isin(locs)]
+    if vendors:
+        df = df[df["Vendor_code"].isin(vendors)]
+    lines = build_lines(df)
+    return lines, build_item_days(lines)
 
 
 if __name__ == "__main__":

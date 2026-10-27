@@ -6,7 +6,7 @@ Streamlit tools for Nagare truck data (`nagare_data.parquet`, kept out of git).
 |---|---|
 | `nagare_trip_report.py` | Supply time → Trip → Item × Day table for one month; Excel export with one tab per month |
 | `vendor_trip_planner.py` | Min / typical / max trips per vendor, by weekday and supply slot, plus trips from planned quantity; Excel export |
-| `trip_demand_analysis.py` | Trips to plan per supply time, arrival window vs supply time, materials that arrive in each slot, and what drives trips up (weekday, month position, planned qty); Excel export |
+| `trip_demand_analysis.py` | PLAN tab (trips per supply slot, real gate-entry window, materials to expect), arrival profile, materials per slot, day detail with part-deliveries (10/15 5/15), demand drivers; date-range filter; Excel export |
 
 ## Run
 ```
