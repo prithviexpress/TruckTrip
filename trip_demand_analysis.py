@@ -15,6 +15,7 @@ Run:      streamlit run trip_demand_analysis.py
 
 import io
 import math
+import re
 
 import altair as alt
 import numpy as np
@@ -571,42 +572,210 @@ def std_stop_minutes(ibd, std, item_col, pack_col, time_col, basis, allow_pct,
     return out.reset_index().drop(columns="raw"), missing
 
 
+def bay_parts(bay: str):
+    m = re.match(r"^(.*?)(\d+)$", str(bay))
+    return (m.group(1), int(m.group(2))) if m else (str(bay), None)
+
+
+def auto_compat(bays, k: int) -> dict:
+    """Fallback bays from the bay name: same letter group, number within +-k
+    (AR-L3 -> AR-L2, AR-L4, AR-L1, AR-L5 for k=2), nearest first."""
+    parts = {b: bay_parts(b) for b in bays}
+    out = {}
+    for b, (pre, n) in parts.items():
+        if n is None or k <= 0:
+            out[b] = []
+            continue
+        cand = [o for o, (p2, n2) in parts.items()
+                if o != b and p2 == pre and n2 is not None and abs(n2 - n) <= k]
+        out[b] = sorted(cand, key=lambda o: (abs(parts[o][1] - n), parts[o][1]))
+    return out
+
+
+def compat_table(compat: dict) -> pd.DataFrame:
+    return pd.DataFrame({"Bay": list(compat), "Fallback": [", ".join(v) for v in compat.values()]})
+
+
+def apply_compat_override(compat: dict, table: pd.DataFrame) -> dict:
+    """Bays listed in the file replace the automatic fallbacks (columns Bay and
+    Fallback; fallbacks separated by comma, semicolon or space)."""
+    cols = {str(c).strip().lower(): c for c in table.columns}
+    if "bay" not in cols or "fallback" not in cols:
+        raise ValueError("needs 'Bay' and 'Fallback' columns")
+    out = dict(compat)
+    for bay, fb in zip(table[cols["bay"]], table[cols["fallback"]]):
+        out[str(bay).strip()] = [x for x in re.split(r"[,; ]+", "" if pd.isna(fb) else str(fb))
+                                 if x]
+    return out
+
+
 def build_bay_schedule(plan: pd.DataFrame, bays: pd.DataFrame, crit_bays: set,
-                       gap: int, dur: dict = None) -> pd.DataFrame:
+                       gap: int, dur: dict = None, compat: dict = None,
+                       reserve: bool = True, hot_bays=()) -> pd.DataFrame:
     """Indicative bay windows. Each vendor + slot visits its bays in order
     (critical bays first, then most-used) starting at its safe start. A bay is
-    held by one truck at a time, so a stop is pushed back when the bay is still
-    booked by an earlier vendor-slot."""
-    order = (bays.assign(crit=[(v, s, b) in crit_bays for v, s, b in
+    held by one truck at a time. With `reserve`, a stop is only placed where at
+    least one fallback bay stays free for its window, so a slip can move to a
+    neighbour. Stops that end up with no free fallback are hot; with `hot_bays`
+    they are moved to those reserved bays."""
+    compat = compat or {}
+    rev = {}
+    for y, fs in compat.items():
+        for f in fs:
+            rev.setdefault(f, set()).add(y)
+    order = (bays.assign(crit=[(v, s_, b_) in crit_bays for v, s_, b_ in
                                zip(bays["Vendor_code"], bays["Supply_Time"],
                                    bays["unloading_loc"].astype(str))])
                  .sort_values(["Vendor_code", "Supply_Time", "crit", "pct"],
                               ascending=[True, True, False, False]))
     seq = {k: g for k, g in order.groupby(["Vendor_code", "Supply_Time"])}
-    free, rows = {}, []
+    has_crit = {k: bool(g["crit"].any()) for k, g in seq.items()}
+    book, stops, rows = {}, {}, []
+
+    def free(bay, s_, e_):
+        return all(not (s_ < e2 and s2 < e_) for s2, e2, _ in book.get(bay, []))
+
+    def free_fb(bay, s_, e_):
+        return [f for f in compat.get(bay, []) if free(f, s_, e_)]
+
+    def keeps_reserve(bay, s_, e_):
+        return not compat.get(bay) or bool(free_fb(bay, s_, e_))
+
+    def try_place(bay, cursor, mins, sid, use_reserve):
+        ends = sorted({e2 for b_ in [bay] + compat.get(bay, [])
+                       for _, e2, _ in book.get(b_, []) if e2 > cursor})
+        for begin in [cursor] + ends[:80]:
+            end = begin + mins
+            if not free(bay, begin, end + gap):
+                continue
+            if use_reserve:
+                book.setdefault(bay, []).append((begin, end + gap, sid))
+                ok = keeps_reserve(bay, begin, end) and all(
+                    keeps_reserve(v["bay"], v["s"], v["e"]) for k_, v in stops.items()
+                    if v["bay"] in rev.get(bay, ()) and v["s"] < end + gap and begin < v["e"])
+                book[bay].pop()
+                if not ok:
+                    continue
+            return begin
+        return None
+
     plan = plan.assign(abs_start=[_slot_min(sl) + st for sl, st in
                                   zip(plan["Supply_Time"], plan["start"])])
-    for r in plan.sort_values("abs_start").itertuples():
+    plan = plan.assign(_k=[not has_crit.get((v, sl), False) for v, sl in
+                           zip(plan["Vendor_code"], plan["Supply_Time"])])
+    sid = 0
+    for r in plan.sort_values(["_k", "abs_start"]).itertuples():
         g = seq.get((r.Vendor_code, r.Supply_Time))
         if g is None:
             continue
         cursor = r.abs_start
         for i, b in enumerate(g.itertuples(), start=1):
+            sid += 1
             bay = str(b.unloading_loc)
             own = (dur or {}).get((r.Vendor_code, r.Supply_Time, bay))
             mins = own if own else r.mins
-            begin = max(cursor, free.get(bay, -1e9))
+            begin = try_place(bay, cursor, mins, sid, reserve and bool(compat.get(bay)))
+            if begin is None:
+                begin = try_place(bay, cursor, mins, sid, False)
+            if begin is None:
+                begin = max([cursor] + [e2 for _, e2, _ in book.get(bay, [])])
             end = begin + mins
-            free[bay] = end + gap
-            rows.append({"Vendor": r.Vendor_code, "Slot": r.Supply_Time, "Stop": i,
-                         "Bay": bay, "From": slot_clock("00:00", begin),
-                         "To": slot_clock("00:00", end),
-                         "Min": int(mins),
+            book.setdefault(bay, []).append((begin, end + gap, sid))
+            stops[sid] = {"bay": bay, "s": begin, "e": end}
+            rows.append({"sid": sid, "Vendor": r.Vendor_code, "Slot": r.Supply_Time,
+                         "Stop": i, "Planned bay": bay, "Min": int(mins),
                          "Minutes basis": "Your standard" if own else r.basis,
                          "Pushed (min)": int(begin - cursor),
                          "Critical bay": "YES" if b.crit else ""})
             cursor = end + gap
-    return pd.DataFrame(rows)
+
+    # hot stops: no fallback bay exists or none is free
+    def reasons(sid_):
+        v = stops[sid_]
+        out = []
+        if not compat.get(v["bay"]):
+            out.append("No fallback bay defined")
+        elif not free_fb(v["bay"], v["s"], v["e"]):
+            out.append("No free fallback")
+        return out
+
+    moved = {}
+    hot_bays = [str(h) for h in hot_bays]
+    if hot_bays:
+        for sid_ in list(stops):
+            if reasons(sid_) and stops[sid_]["bay"] not in hot_bays:
+                v = stops[sid_]
+                book[v["bay"]] = [x for x in book[v["bay"]] if x[2] != sid_]
+                best = None
+                for hb in hot_bays:
+                    cand = sorted({v["s"]} | {e2 for _, e2, _ in book.get(hb, []) if e2 > v["s"]})
+                    for begin in cand:
+                        if free(hb, begin, begin + (v["e"] - v["s"]) + gap):
+                            if best is None or begin < best[0]:
+                                best = (begin, hb)
+                            break
+                if best is None:
+                    book[v["bay"]].append((v["s"], v["e"] + gap, sid_))
+                    continue
+                begin, hb = best
+                book.setdefault(hb, []).append((begin, begin + (v["e"] - v["s"]) + gap, sid_))
+                moved[sid_] = v["bay"]
+                stops[sid_] = {"bay": hb, "s": begin, "e": begin + (v["e"] - v["s"])}
+
+    out = []
+    for row in rows:
+        sid_ = row.pop("sid")
+        v = stops[sid_]
+        why = reasons(sid_) if sid_ not in moved else ["Hot lane (no fallback at planned bay)"]
+        if sid_ not in moved and v["bay"] in hot_bays:
+            why = []          # stops planned on a hot-lane bay are the lane's normal load
+        if row["Critical bay"]:
+            why = ["Critical part"] + why
+        ff = free_fb(v["bay"], v["s"], v["e"]) if sid_ not in moved else []
+        out.append({**{k: row[k] for k in ("Vendor", "Slot", "Stop")},
+                    "Bay": v["bay"], "Planned bay": row["Planned bay"] if sid_ in moved else "",
+                    "From": slot_clock("00:00", v["s"]), "To": slot_clock("00:00", v["e"]),
+                    **{k: row[k] for k in ("Min", "Minutes basis", "Pushed (min)",
+                                           "Critical bay")},
+                    "Free fallback bays": ", ".join(ff), "Hot": "YES" if why else "",
+                    "Hot reason": "; ".join(why)})
+    return pd.DataFrame(out)
+
+
+def simulate_bays(trips: pd.DataFrame, durf, compat: dict, gap: int, fallback: bool) -> dict:
+    """Replay real gate entries: trucks take their bays in order. Without
+    fallback a truck waits for its planned bay; with fallback it takes a free
+    neighbour, and if none is free it counts as hot and waits for the earliest."""
+    waits, swapped, hot = [], 0, 0
+    for day, g in trips.groupby("Nag_date"):
+        free = {}
+        for r in g.sort_values("arrival").itertuples():
+            t = (r.arrival - day).total_seconds() / 60
+            for bay in r.bays:
+                mins = durf(r.Vendor_code, r.Supply_Time, bay)
+                use = bay
+                if fallback:
+                    opts = [bay] + compat.get(bay, [])
+                    avail = [o for o in opts if free.get(o, -1e9) <= t]
+                    if bay in avail:
+                        use = bay
+                    elif avail:
+                        use = avail[0]
+                        swapped += 1
+                    else:
+                        use = min(opts, key=lambda o: free[o])
+                        hot += 1
+                begin = max(t, free.get(use, -1e9))
+                waits.append(begin - t)
+                free[use] = begin + mins + gap
+                t = begin + mins + gap
+    w = np.array(waits) if waits else np.zeros(1)
+    n = max(len(waits), 1)
+    return {"Stops": len(waits), "Average wait (min)": round(float(w.mean()), 1),
+            "P90 wait (min)": round(float(np.quantile(w, 0.9)), 1),
+            "Stops waiting > 10 min %": round(100 * float((w > 10).mean()), 1),
+            "Moved to a fallback bay %": round(100 * swapped / n, 1),
+            "Hot (no free bay) %": round(100 * hot / n, 1)}
 
 
 def read_critical(upload) -> set:
@@ -902,6 +1071,28 @@ def bay_schedule_tab(R, df):
 
     rows = R["vs_bay_rows"]
     rows = rows.merge(plan[["Vendor_code", "Supply_Time"]], on=["Vendor_code", "Supply_Time"])
+    universe = sorted(df["unloading_loc"].astype(str).unique())
+    c3 = st.columns(4)
+    kfb = c3[0].select_slider("Fallback bays within +- N numbers", [0, 1, 2, 3], value=2)
+    reserve = c3[1].checkbox("Keep a free fallback bay when planning", value=True)
+    hot_bays = c3[2].multiselect("Hot-lane bays (optional)", universe,
+                                 help="Stops with no free fallback move here")
+    compat = auto_compat(universe, int(kfb))
+    with c3[3]:
+        cu = st.file_uploader("Fallback map to override (CSV: Bay, Fallback)", type=["csv", "xlsx"],
+                              key="compat_up")
+        if cu is not None:
+            try:
+                st.session_state["compat_df"] = read_table(cu)
+            except Exception as e:
+                st.error(f"Could not read fallback map: {e}")
+    if st.session_state.get("compat_df") is not None:
+        try:
+            compat = apply_compat_override(compat, st.session_state["compat_df"])
+        except Exception as e:
+            st.error(f"Fallback map ignored: {e}")
+    st.download_button("Download fallback map to edit", compat_table(compat).to_csv(index=False),
+                       file_name="fallback_map.csv", mime="text/csv")
     crit_bays = set()
     if crit:
         cr = df[df["Item"].astype(str).isin(crit)]
@@ -911,7 +1102,7 @@ def bay_schedule_tab(R, df):
                                            Supply_Time=plan["Supply_Time"].astype(str)),
                                rows.assign(Vendor_code=rows["Vendor_code"].astype(str),
                                            Supply_Time=rows["Supply_Time"].astype(str)),
-                               crit_bays, int(gap), dur)
+                               crit_bays, int(gap), dur, compat, reserve, hot_bays)
 
     head = plan.assign(**{
         "Safe start": [slot_clock(a_, b_) for a_, b_ in zip(plan["Supply_Time"], plan["start"])],
@@ -959,6 +1150,36 @@ def bay_schedule_tab(R, df):
                 e["Nag_date"] = e["Nag_date"].dt.date
                 st.dataframe(e.head(500), hide_index=True, width="stretch")
 
+    st.subheader("2b. Replay: do fallback bays cut the waiting?")
+    sim_cut = vt["Nag_date"].max() - pd.Timedelta(days=int(test_days) - 1)
+    dtest = df[df["Nag_date"] >= sim_cut]
+    if dtest.empty or sched.empty:
+        st.info("Nothing to replay.")
+        sim_tbl = pd.DataFrame()
+    else:
+        rank = {(str(v), str(s_), str(b_)): i for i, (v, s_, b_) in enumerate(
+            zip(rows["Vendor_code"], rows["Supply_Time"], rows["unloading_loc"]))}
+        tr = (dtest.groupby(["Nag_date", "trip_key", "Vendor_code", "Supply_Time"])
+                   .agg(arrival=("Gate_entry_time", "min"),
+                        bays=("unloading_loc", lambda s_: list(dict.fromkeys(map(str, s_)))))
+                   .reset_index().dropna(subset=["arrival"]))
+        tr["bays"] = [sorted(b_, key=lambda x, v=v, s_=s_: rank.get((str(v), str(s_), x), 999))
+                      for b_, v, s_ in zip(tr["bays"], tr["Vendor_code"], tr["Supply_Time"])]
+        vs_min = {(str(a_), str(b_)): m_ for a_, b_, m_ in
+                  zip(plan["Vendor_code"], plan["Supply_Time"], plan["mins"])}
+        durf = lambda v, s_, bay: dur.get((str(v), str(s_), bay)) or vs_min.get(
+            (str(v), str(s_)), manual)
+        base_m = simulate_bays(tr, durf, compat, int(gap), False)
+        fb_m = simulate_bays(tr, durf, compat, int(gap), True)
+        sim_tbl = pd.DataFrame({"Metric": list(base_m), "Planned bay only": list(base_m.values()),
+                                "With fallback bays": list(fb_m.values())})
+        st.dataframe(sim_tbl, hide_index=True, width="stretch")
+        st.caption(f"Last {int(test_days)} days of real gate entries, each truck taking its "
+                   "bays in order. Without fallback a truck waits for its planned bay; with "
+                   "fallback it takes a free neighbour, and 'hot' means none was free. "
+                   "Stop lengths come from your minutes settings. A simplification: bays "
+                   "are not shared with trucks outside the vendors listed.")
+
     st.subheader("3. Indicative bay windows")
     if sched.empty:
         st.info("No vendor and slot meets the filters.")
@@ -980,6 +1201,26 @@ def bay_schedule_tab(R, df):
                      hide_index=True, width="stretch")
         with st.expander("All indicative windows"):
             st.dataframe(sched, hide_index=True, width="stretch")
+        st.subheader("4. Hot trips: handle separately")
+        hot = sched[sched["Hot"] == "YES"]
+        hk = st.columns(3)
+        hk[0].metric("Hot stops", f"{100 * len(hot) / len(sched):.0f}%", f"{len(hot)} of {len(sched)}")
+        hk[1].metric("Vendor-slots with a hot stop",
+                     hot.groupby(["Vendor", "Slot"]).ngroups if len(hot) else 0)
+        hk[2].metric("Critical-part stops", int((sched["Critical bay"] == "YES").sum()))
+        if hot.empty:
+            st.success("No hot stops with these settings.")
+        else:
+            hot_trips = (hot.groupby(["Vendor", "Slot"])
+                            .agg(**{"Hot stops": ("Stop", "size"),
+                                    "Bays": ("Bay", lambda v: ", ".join(v)),
+                                    "Why": ("Hot reason", lambda v: "; ".join(sorted(set(v))))})
+                            .reset_index())
+            st.dataframe(hot_trips, hide_index=True, width="stretch")
+        st.caption("Hot = carries a critical part, or no fallback bay is free (or defined) "
+                   "for its window. If hot stops are more than about 10% of the plan, the "
+                   "plan is too tight: widen windows, add a reserved hot-lane bay, or move "
+                   "a vendor to another slot.")
         st.caption("Windows are indicative. Stops go in order, critical bays first, then "
                    "the bay the vendor uses most. 'Pushed' means another vendor holds that "
                    "bay then, so this stop starts later than the vendor's own sequence "
@@ -987,7 +1228,12 @@ def bay_schedule_tab(R, df):
                    "plan assumes every listed vendor comes: that is the busy case.")
 
     if st.button("Prepare bay schedule file", key="bs_btn"):
-        sheets = {"Safe start & hard stop": head, "Bay windows": sched}
+        sheets = {"Safe start & hard stop": head, "Bay windows": sched,
+                  "Fallback map": compat_table(compat)}
+        if not sched.empty:
+            sheets["Hot stops"] = sched[sched["Hot"] == "YES"]
+        if not sim_tbl.empty:
+            sheets["Fallback replay"] = sim_tbl
         if rp is not None and not wd_list.empty:
             sheets["Replay withdrawals"] = wd_list[["Nag_date", "Supply_Time", "Vendor_code",
                                                     "Arrived", "Hard stop",
