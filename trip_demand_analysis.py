@@ -24,7 +24,7 @@ import streamlit as st
 DEFAULT_PATH = "nagare_data.parquet"
 COLS = ["Schedule_no", "Item", "Item_name", "Vendor_code", "unloading_loc", "Nag_date",
         "Supply_Time", "Nag_qty", "Received_qty", "Truck_number",
-        "Consignement_no", "Gate_entry_time"]
+        "Consignement_no", "Gate_entry_time", "Gate_Out_time"]
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MAX_EARLY_H = 12     # arrivals earlier than this before the slot are treated as
 MAX_LATE_H = 12      # a different schedule's truck (or a data error), not this one
@@ -40,6 +40,9 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     df["Gate_entry_time"] = pd.to_datetime(df["Gate_entry_time"],
                                            format="%d-%b-%Y %H:%M",
                                            errors="coerce")
+    if "Gate_Out_time" in df.columns:
+        df["Gate_Out_time"] = pd.to_datetime(df["Gate_Out_time"],
+                                             format="%d-%b-%Y %H:%M", errors="coerce")
     df["Supply_Time"] = df["Supply_Time"].astype(str).str.strip().str.slice(0, 5)
     df["unloading_loc"] = df["unloading_loc"].fillna("").astype(str).str.strip()
     df["Schedule_no"] = df["Schedule_no"].fillna("").astype(str).str.strip()
@@ -62,7 +65,9 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_resource(show_spinner="Loading parquet…")
 def load(path: str) -> pd.DataFrame:
-    return clean(pd.read_parquet(path, columns=COLS))
+    import pyarrow.parquet as pq
+    have = set(pq.read_schema(path).names)
+    return clean(pd.read_parquet(path, columns=[c for c in COLS if c in have]))
 
 
 # ----------------------------------------------------------------------------
@@ -324,14 +329,20 @@ def vendor_trips(df: pd.DataFrame) -> pd.DataFrame:
     return vt[vt["offset_min"].between(-MAX_EARLY_H * 60, MAX_LATE_H * 60)]
 
 
-def bay_share(df: pd.DataFrame, k: list) -> pd.DataFrame:
-    """Bays used per group k, as % of its gate entries (>=10%, top 5)."""
+def bay_share_rows(df: pd.DataFrame, k: list) -> pd.DataFrame:
+    """Per group k and bay: % of the group's gate entries that stop there
+    (>=10%, top 5 bays)."""
     total = df.groupby(k)["trip_key"].nunique().rename("n").reset_index()
     at = (df.groupby(k + ["unloading_loc"])["trip_key"].nunique().rename("v")
             .reset_index().merge(total, on=k))
     at["pct"] = 100 * at["v"] / at["n"]
     at = at[at["pct"] >= 10].sort_values(k + ["pct"], ascending=[True] * len(k) + [False])
-    at = at.groupby(k).head(5)
+    return at.groupby(k).head(5)
+
+
+def bay_share(df: pd.DataFrame, k: list) -> pd.DataFrame:
+    """Bays used per group k as text, e.g. 'WR-03 82%, WR-01 40%'."""
+    at = bay_share_rows(df, k)
     at["txt"] = (at["unloading_loc"].astype(str) + " "
                  + at["pct"].round().astype(int).astype(str) + "%")
     return at.groupby(k)["txt"].agg(", ".join).rename("Bays").reset_index()
@@ -430,6 +441,117 @@ def replay_windows(vt: pd.DataFrame, cov, min_n, step, max_width, test_days):
                "late_typ": float(per_day["Late"].median()),
                "days": len(days), "from": cut}
     return per_day, exc, by_v, summary
+
+
+def stop_minutes(df: pd.DataFrame) -> pd.DataFrame:
+    """Observed minutes per bay stop per vendor + slot: gate entry to gate out
+    divided by the bays visited. Dwell outside 10 min - 10 h is treated as bad
+    data. Includes queueing, so it overstates pure unloading time."""
+    if "Gate_Out_time" not in df.columns:
+        return pd.DataFrame(columns=["Vendor_code", "Supply_Time", "n", "obs"])
+    t = (df.groupby(["Vendor_code", "Supply_Time", "trip_key"])
+           .agg(gin=("Gate_entry_time", "min"), gout=("Gate_Out_time", "max"),
+                bays=("unloading_loc", "nunique")).reset_index())
+    t["dwell"] = (t["gout"] - t["gin"]).dt.total_seconds() / 60
+    t = t[t["dwell"].between(10, 600)]
+    t["per_bay"] = t["dwell"] / t["bays"]
+    return (t.groupby(["Vendor_code", "Supply_Time"])
+              .agg(n=("per_bay", "size"), obs=("per_bay", "median")).reset_index())
+
+
+def arrival_habit(vt: pd.DataFrame, q_start, q_stop, grace, min_n, step):
+    """Safe start = the minute by which q_start of a vendor's trucks have
+    arrived; hard stop = q_stop plus grace. Slot-wide figures stand in for
+    vendors with fewer than min_n trucks in the slot."""
+    qs = [q_start, q_stop]
+    sq = vt.groupby("Supply_Time")["offset_min"].quantile(qs).unstack()
+    sq.columns = ["s_a", "s_b"]
+    g = vt.groupby(["Vendor_code", "Supply_Time"])["offset_min"]
+    vq = g.quantile(qs).unstack()
+    vq.columns = ["v_a", "v_b"]
+    w = (g.size().rename("Trucks").to_frame().join(vq).reset_index()
+          .merge(sq.reset_index(), on="Supply_Time"))
+    own = w["Trucks"] >= min_n
+    w["start"] = np.ceil(np.where(own, w["v_a"], w["s_a"]) / step) * step
+    w["stop"] = np.ceil((np.where(own, w["v_b"], w["s_b"]) + grace) / step) * step
+    w["Basis"] = np.where(own, "Vendor history", "Slot default (few trucks)")
+    sdef = sq.reset_index()
+    sdef["start"] = np.ceil(sdef["s_a"] / step) * step
+    sdef["stop"] = np.ceil((sdef["s_b"] + grace) / step) * step
+    return w[["Vendor_code", "Supply_Time", "Trucks", "start", "stop", "Basis"]], \
+        sdef[["Supply_Time", "start", "stop"]]
+
+
+def replay_habit(vt, q_start, q_stop, grace, min_n, step, test_days):
+    """Fit start/stop on older data, test on the last `test_days` days. A truck
+    before the start waits in the yard; between start and stop it is served late
+    against the plan; after the stop its slot is withdrawn."""
+    cut = vt["Nag_date"].max() - pd.Timedelta(days=test_days - 1)
+    train, test = vt[vt["Nag_date"] < cut], vt[vt["Nag_date"] >= cut]
+    if train.empty or test.empty:
+        return None
+    w, sdef = arrival_habit(train, q_start, q_stop, grace, min_n, step)
+    t = (test.merge(w[["Vendor_code", "Supply_Time", "start", "stop"]],
+                    on=["Vendor_code", "Supply_Time"], how="left")
+             .merge(sdef.rename(columns={"start": "s0", "stop": "s1"}),
+                    on="Supply_Time", how="left"))
+    t["start"], t["stop"] = t["start"].fillna(t["s0"]), t["stop"].fillna(t["s1"])
+    t = t.dropna(subset=["start", "stop"])
+    t["Status"] = np.select([t["offset_min"] < t["start"], t["offset_min"] > t["stop"]],
+                            ["Waits in yard", "Withdrawn"], "On plan, late")
+    early = t["Status"] == "Waits in yard"
+    on = t["Status"] == "On plan, late"
+    days = pd.date_range(test["Nag_date"].min(), test["Nag_date"].max(), freq="D")
+    wd_day = (t[t["Status"] == "Withdrawn"].groupby("Nag_date").size()
+                .reindex(days, fill_value=0))
+    sm = {"trucks": len(t), "from": cut, "days": len(days),
+          "wait_pct": 100 * early.mean(),
+          "wait_med": float((t.loc[early, "start"] - t.loc[early, "offset_min"]).median())
+          if early.any() else 0.0,
+          "late_pct": 100 * on.mean(),
+          "late_p90": float((t.loc[on, "offset_min"] - t.loc[on, "start"]).quantile(0.9))
+          if on.any() else 0.0,
+          "wd_pct": 100 * (t["Status"] == "Withdrawn").mean(),
+          "wd_typ": float(wd_day.median()), "wd_p90": float(wd_day.quantile(0.9))}
+    wd = t[t["Status"] == "Withdrawn"].copy()
+    wd["Arrived"] = wd["arrival"].dt.strftime("%d-%b %H:%M")
+    wd["Hard stop"] = [slot_clock(a, b) for a, b in zip(wd["Supply_Time"], wd["stop"])]
+    wd["Minutes after stop"] = (wd["offset_min"] - wd["stop"]).round()
+    return sm, wd.sort_values("Minutes after stop", ascending=False)
+
+
+def build_bay_schedule(plan: pd.DataFrame, bays: pd.DataFrame, crit_bays: set,
+                       gap: int) -> pd.DataFrame:
+    """Indicative bay windows. Each vendor + slot visits its bays in order
+    (critical bays first, then most-used) starting at its safe start. A bay is
+    held by one truck at a time, so a stop is pushed back when the bay is still
+    booked by an earlier vendor-slot."""
+    order = (bays.assign(crit=[(v, s, b) in crit_bays for v, s, b in
+                               zip(bays["Vendor_code"], bays["Supply_Time"],
+                                   bays["unloading_loc"].astype(str))])
+                 .sort_values(["Vendor_code", "Supply_Time", "crit", "pct"],
+                              ascending=[True, True, False, False]))
+    seq = {k: g for k, g in order.groupby(["Vendor_code", "Supply_Time"])}
+    free, rows = {}, []
+    plan = plan.assign(abs_start=[_slot_min(sl) + st for sl, st in
+                                  zip(plan["Supply_Time"], plan["start"])])
+    for r in plan.sort_values("abs_start").itertuples():
+        g = seq.get((r.Vendor_code, r.Supply_Time))
+        if g is None:
+            continue
+        cursor = r.abs_start
+        for i, b in enumerate(g.itertuples(), start=1):
+            bay = str(b.unloading_loc)
+            begin = max(cursor, free.get(bay, -1e9))
+            end = begin + r.mins
+            free[bay] = end + gap
+            rows.append({"Vendor": r.Vendor_code, "Slot": r.Supply_Time, "Stop": i,
+                         "Bay": bay, "From": slot_clock("00:00", begin),
+                         "To": slot_clock("00:00", end),
+                         "Pushed (min)": int(begin - cursor),
+                         "Critical bay": "YES" if b.crit else ""})
+            cursor = end + gap
+    return pd.DataFrame(rows)
 
 
 def read_critical(upload) -> set:
@@ -600,8 +722,172 @@ def analyse(path, dr, locs, vendors, split_loc, lo, plan_q, win, bucket, core, w
         p_hour=arrival_by_bucket(df, bucket, plan_q, wd), daily_tot=daily_tot,
         bay_table=bay_table, bay_keys=bay_keys, bays_per_trip=bays_per_trip,
         vt=vendor_trips(df), vs_bays=bay_share(df, ["Vendor_code", "Supply_Time"]),
+        vs_bay_rows=bay_share_rows(df, ["Vendor_code", "Supply_Time"]),
+        stop_min=stop_minutes(df),
         bay_load=bay_load_stats(df))
     return R
+
+
+def critical_input(key: str) -> set:
+    """Uploader for critical items; the loaded set is shared across tabs."""
+    up = st.file_uploader("Critical items (CSV/Excel with an 'Item' column; optional "
+                          "'Critical' Y/N column)", type=["csv", "xlsx"], key=key)
+    if up is not None:
+        try:
+            st.session_state["crit_items"] = read_critical(up)
+        except Exception as e:
+            st.error(f"Could not read critical items: {e}")
+    crit = st.session_state.get("crit_items", set())
+    if crit:
+        st.caption(f"{len(crit)} critical items loaded (used on every tab).")
+    return crit
+
+
+def bay_schedule_tab(R, df):
+    st.markdown("Fix an **indicative bay schedule** from arrival habit. Each vendor and "
+                "slot gets a **safe start** (the time by which most of its trucks have "
+                "usually arrived), a **hard stop** after which the slot is withdrawn, "
+                "and indicative windows for each bay in between.")
+    a = st.columns(5)
+    day_pick = a[0].selectbox("Plan for weekday", ["All days"] + WEEKDAYS)
+    q_start = a[1].select_slider("Safe start = trucks arrived by", [0.5, 0.7, 0.8, 0.9],
+                                 value=0.8, format_func=lambda v: f"P{int(v*100)}")
+    q_stop = a[2].select_slider("Hard stop = trucks arrived by", [0.9, 0.95, 0.99],
+                                value=0.95, format_func=lambda v: f"P{int(v*100)}")
+    grace = a[3].select_slider("Grace after that (min)", [0, 15, 30, 45], value=15)
+    step = a[4].select_slider("Round to (min)", [5, 15, 30], value=15, key="bs_step")
+    b = st.columns(5)
+    min_n = b[0].number_input("Min trucks for own timing", 3, 100, 10, key="bs_minn")
+    mode = b[1].radio("Minutes per bay stop", ["Manual", "Observed"], horizontal=True)
+    manual = b[2].number_input("Manual minutes per stop", 5, 90, 25)
+    gap = b[3].number_input("Gap between stops (min)", 0, 30, 5)
+    min_run = b[4].number_input("Include vendors running on at least (% days)", 0, 100, 20)
+    test_days = st.number_input("Replay: last N days", 7, 60, 14, key="bs_test")
+    crit = critical_input("crit_bay")
+
+    vt = R["vt"]
+    n_days = df["Nag_date"].nunique()
+    if day_pick != "All days":
+        dsel = WEEKDAYS.index(day_pick)
+        vt = vt[vt["Nag_date"].dt.dayofweek == dsel]
+        n_days = df.loc[df["Nag_date"].dt.dayofweek == dsel, "Nag_date"].nunique()
+    if vt.empty:
+        st.info("No gate entries for this weekday.")
+        return
+
+    w, _ = arrival_habit(vt, q_start, q_stop, grace, int(min_n), step)
+    runs = (vt.groupby(["Vendor_code", "Supply_Time"])["Nag_date"].nunique()
+              .rename("days").reset_index())
+    w = w.merge(runs, on=["Vendor_code", "Supply_Time"])
+    w["Runs on % of days"] = (100 * w["days"] / max(n_days, 1)).round().astype(int)
+    sm_ = R["stop_min"]
+    w = w.merge(sm_, on=["Vendor_code", "Supply_Time"], how="left")
+    use_obs = (mode == "Observed") & w["n"].fillna(0).ge(int(min_n))
+    w["mins"] = np.where(use_obs, (w["obs"].fillna(manual) / 5).round().clip(2, 12) * 5,
+                         manual)
+    w["Minutes basis"] = np.where(use_obs, "Observed", "Manual")
+    if mode == "Observed" and sm_.empty:
+        st.warning("No Gate_Out_time in the data, so the manual minutes are used.")
+    plan = w[w["Runs on % of days"] >= min_run].copy()
+
+    rows = R["vs_bay_rows"]
+    rows = rows.merge(plan[["Vendor_code", "Supply_Time"]], on=["Vendor_code", "Supply_Time"])
+    crit_bays = set()
+    if crit:
+        cr = df[df["Item"].astype(str).isin(crit)]
+        crit_bays = set(zip(cr["Vendor_code"].astype(str), cr["Supply_Time"].astype(str),
+                            cr["unloading_loc"].astype(str)))
+    sched = build_bay_schedule(plan.assign(Vendor_code=plan["Vendor_code"].astype(str),
+                                           Supply_Time=plan["Supply_Time"].astype(str)),
+                               rows.assign(Vendor_code=rows["Vendor_code"].astype(str),
+                                           Supply_Time=rows["Supply_Time"].astype(str)),
+                               crit_bays, int(gap))
+
+    head = plan.assign(**{
+        "Safe start": [slot_clock(a_, b_) for a_, b_ in zip(plan["Supply_Time"], plan["start"])],
+        "Hard stop (withdraw slot)": [slot_clock(a_, b_) for a_, b_ in
+                                      zip(plan["Supply_Time"], plan["stop"])]})
+    nb = rows.groupby(["Vendor_code", "Supply_Time"]).size().rename("Bays").reset_index()
+    head = head.merge(nb, on=["Vendor_code", "Supply_Time"], how="left")
+    head = head[["Vendor_code", "Supply_Time", "Safe start", "Hard stop (withdraw slot)",
+                 "Bays", "mins", "Minutes basis", "Trucks", "Runs on % of days",
+                 "Basis"]].rename(columns={"Vendor_code": "Vendor", "Supply_Time": "Slot",
+                                           "mins": "Min per stop", "Trucks": "Trucks in history"})
+    head = head.sort_values(["Slot", "Vendor"])
+
+    st.subheader("1. Safe start and hard stop per vendor and slot")
+    st.dataframe(head, hide_index=True, width="stretch")
+    st.caption("Before the safe start the truck waits in the yard. Between safe start "
+               "and hard stop it is served as soon as a bay is free. After the hard "
+               "stop the slot is withdrawn and the truck is re-queued.")
+
+    st.subheader("2. Replay: how often would this have bitten?")
+    rp = replay_habit(vt, q_start, q_stop, grace, int(min_n), step, int(test_days))
+    if rp is None:
+        st.info("Not enough history before the replay period.")
+        wd_list = pd.DataFrame()
+    else:
+        sm, wd_list = rp
+        m = st.columns(4)
+        m[0].metric("Trucks waiting in yard", f"{sm['wait_pct']:.0f}%",
+                    f"median {sm['wait_med']:.0f} min")
+        m[1].metric("Served late vs safe start", f"{sm['late_pct']:.0f}%",
+                    f"P90 {sm['late_p90']:.0f} min")
+        m[2].metric("Slots withdrawn", f"{sm['wd_pct']:.1f}%")
+        m[3].metric("Withdrawals, bad day (P90)", f"{sm['wd_p90']:.0f}",
+                    f"typical {sm['wd_typ']:.0f}")
+        st.caption(f"Timings fitted before {sm['from']:%d-%b-%Y}, tested on the last "
+                   f"{sm['days']} days ({sm['trucks']} trucks). Raise the hard-stop "
+                   "percentile or grace if withdrawals are too many; lower the safe-start "
+                   "percentile if too many trucks wait.")
+        with st.expander("Trucks whose slot would have been withdrawn"):
+            if wd_list.empty:
+                st.write("None.")
+            else:
+                e = wd_list[["Nag_date", "Supply_Time", "Vendor_code", "Arrived",
+                             "Hard stop", "Minutes after stop"]].copy()
+                e["Nag_date"] = e["Nag_date"].dt.date
+                st.dataframe(e.head(500), hide_index=True, width="stretch")
+
+    st.subheader("3. Indicative bay windows")
+    if sched.empty:
+        st.info("No vendor and slot meets the filters.")
+    else:
+        pushed = sched[sched["Pushed (min)"] > 0]
+        k = st.columns(3)
+        k[0].metric("Stops planned", len(sched))
+        k[1].metric("Stops pushed by a busy bay", len(pushed))
+        k[2].metric("Largest push (min)", int(sched["Pushed (min)"].max()))
+        pick = st.selectbox("Preview one trip card",
+                            sorted({f"{v} @ {s}" for v, s in zip(sched["Vendor"], sched["Slot"])}))
+        pv, ps = pick.split(" @ ")
+        card = sched[(sched["Vendor"] == pv) & (sched["Slot"] == ps)]
+        hrow = head[(head["Vendor"] == pv) & (head["Slot"] == ps)].iloc[0]
+        st.markdown(f"**{pv}**, slot {ps}: safe start **{hrow['Safe start']}**, hard stop "
+                    f"**{hrow['Hard stop (withdraw slot)']}**")
+        st.dataframe(card[["Stop", "Bay", "From", "To", "Pushed (min)", "Critical bay"]],
+                     hide_index=True, width="stretch")
+        with st.expander("All indicative windows"):
+            st.dataframe(sched, hide_index=True, width="stretch")
+        st.caption("Windows are indicative. Stops go in order, critical bays first, then "
+                   "the bay the vendor uses most. 'Pushed' means another vendor holds that "
+                   "bay then, so this stop starts later than the vendor's own sequence "
+                   "would; large pushes mean moving a vendor to another slot or bay. The "
+                   "plan assumes every listed vendor comes: that is the busy case.")
+
+    if st.button("Prepare bay schedule file", key="bs_btn"):
+        sheets = {"Safe start & hard stop": head, "Bay windows": sched}
+        if rp is not None and not wd_list.empty:
+            sheets["Replay withdrawals"] = wd_list[["Nag_date", "Supply_Time", "Vendor_code",
+                                                    "Arrived", "Hard stop",
+                                                    "Minutes after stop"]].assign(
+                Nag_date=wd_list["Nag_date"].dt.date)
+        st.session_state["bayfile"] = to_excel(sheets)
+    if "bayfile" in st.session_state:
+        st.download_button("Download bay schedule", st.session_state["bayfile"],
+                           file_name="bay_schedule.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet")
 
 
 def window_planner(R, df):
@@ -615,15 +901,7 @@ def window_planner(R, df):
     step = c[2].select_slider("Round to (min)", [5, 10, 15, 30], value=15)
     max_w = c[3].number_input("Flag windows wider than (min)", 30, 720, 180, step=30)
     test_days = c[4].number_input("Replay: last N days", 7, 60, 14)
-    up = st.file_uploader("Critical items (CSV/Excel with an 'Item' column; optional "
-                          "'Critical' Y/N column)", type=["csv", "xlsx"])
-    crit = set()
-    if up is not None:
-        try:
-            crit = read_critical(up)
-            st.caption(f"{len(crit)} critical items loaded.")
-        except Exception as e:
-            st.error(f"Could not read critical items: {e}")
+    crit = critical_input("crit_win")
 
     vt = R["vt"]
     w, _ = vendor_windows(vt, cov, min_n, step, max_w)
@@ -805,12 +1083,15 @@ def main():
         st.warning("Less than ~5 months of data in range: seasonality and "
                    "month-end effects are unreliable.")
 
-    tp, tw, t1, t2, t4, t5, t3 = st.tabs(
-        ["PLAN", "Window planner", "Trips per supply time", "Gate entry vs supply time",
+    tp, tw, tb, t1, t2, t4, t5, t3 = st.tabs(
+        ["PLAN", "Window planner", "Bay schedule", "Trips per supply time", "Gate entry vs supply time",
          "Materials per slot", "Day detail", "What drives trips up"])
 
     with tw:
         window_planner(R, df)
+
+    with tb:
+        bay_schedule_tab(R, df)
 
     with tp:
         who = "all days" if not wd else "/".join(plan_days)
