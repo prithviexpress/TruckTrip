@@ -315,6 +315,137 @@ def arrival_by_bucket(df: pd.DataFrame, bucket_min: int, plan_q: float,
     return pd.DataFrame(rows)
 
 
+def vendor_trips(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per gate entry per vendor + day + slot, with minutes vs slot."""
+    vt = (df.groupby(["Nag_date", "Supply_Time", "Vendor_code", "trip_key"])
+            .agg(arrival=("Gate_entry_time", "min"), slot_dt=("slot_dt", "first"))
+            .reset_index())
+    vt["offset_min"] = (vt["arrival"] - vt["slot_dt"]).dt.total_seconds() / 60
+    return vt[vt["offset_min"].between(-MAX_EARLY_H * 60, MAX_LATE_H * 60)]
+
+
+def bay_share(df: pd.DataFrame, k: list) -> pd.DataFrame:
+    """Bays used per group k, as % of its gate entries (>=10%, top 5)."""
+    total = df.groupby(k)["trip_key"].nunique().rename("n").reset_index()
+    at = (df.groupby(k + ["unloading_loc"])["trip_key"].nunique().rename("v")
+            .reset_index().merge(total, on=k))
+    at["pct"] = 100 * at["v"] / at["n"]
+    at = at[at["pct"] >= 10].sort_values(k + ["pct"], ascending=[True] * len(k) + [False])
+    at = at.groupby(k).head(5)
+    at["txt"] = (at["unloading_loc"].astype(str) + " "
+                 + at["pct"].round().astype(int).astype(str) + "%")
+    return at.groupby(k)["txt"].agg(", ".join).rename("Bays").reset_index()
+
+
+def bay_load_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """Trucks starting at each bay per clock hour, over all days (zeros kept)."""
+    a = (df.dropna(subset=["Gate_entry_time"])
+           .drop_duplicates(["trip_key", "unloading_loc"])
+           [["unloading_loc", "Gate_entry_time"]])
+    a = a.assign(gdate=a["Gate_entry_time"].dt.normalize(),
+                 hr=a["Gate_entry_time"].dt.hour)
+    n_days = (a["gdate"].max() - a["gdate"].min()).days + 1
+    cnt = a.groupby(["unloading_loc", "hr", "gdate"]).size()
+    rows = []
+    for (bay, hr), c in cnt.groupby(level=[0, 1]):
+        v = np.concatenate([c.to_numpy(), np.zeros(max(n_days - len(c), 0))])
+        rows.append({"Bay": str(bay), "Hour": f"{hr:02d}:00",
+                     "Typical trucks/hr": float(np.median(v)),
+                     "P90 trucks/hr": float(np.quantile(v, 0.9)),
+                     "Max trucks/hr": int(v.max())})
+    return pd.DataFrame(rows)
+
+
+def vendor_windows(vt: pd.DataFrame, cov: float, min_n: int, step: int, max_width: int):
+    """Arrival window per vendor + slot covering `cov` of past trucks. Vendors
+    with fewer than min_n trucks in a slot get the slot-wide window instead."""
+    ql, qh = (1 - cov) / 2, 1 - (1 - cov) / 2
+    sq = vt.groupby("Supply_Time")["offset_min"].quantile([ql, qh]).unstack()
+    sq.columns = ["s_lo", "s_hi"]
+    g = vt.groupby(["Vendor_code", "Supply_Time"])["offset_min"]
+    vq = g.quantile([ql, qh]).unstack()
+    vq.columns = ["v_lo", "v_hi"]
+    w = (g.size().rename("Trucks").to_frame().join(vq).reset_index()
+          .merge(sq.reset_index(), on="Supply_Time"))
+    own = w["Trucks"] >= min_n
+    w["lo"] = np.floor(np.where(own, w["v_lo"], w["s_lo"]) / step) * step
+    w["hi"] = np.ceil(np.where(own, w["v_hi"], w["s_hi"]) / step) * step
+    w["Basis"] = np.where(own, "Vendor history", "Slot default (few trucks)")
+    w["Width (min)"] = (w["hi"] - w["lo"]).astype(int)
+    w["Check"] = np.where(w["Width (min)"] > max_width,
+                          "Wide: truck may serve several slots", "")
+    w["Arrive from"] = [slot_clock(a, b) for a, b in zip(w["Supply_Time"], w["lo"])]
+    w["Arrive by"] = [slot_clock(a, b) for a, b in zip(w["Supply_Time"], w["hi"])]
+    sdef = sq.reset_index()
+    sdef["lo"] = np.floor(sdef["s_lo"] / step) * step
+    sdef["hi"] = np.ceil(sdef["s_hi"] / step) * step
+    return w, sdef[["Supply_Time", "lo", "hi"]]
+
+
+def replay_windows(vt: pd.DataFrame, cov, min_n, step, max_width, test_days):
+    """Fit windows on history before the last `test_days` days, then check them
+    against those days. Returns (per-day exception counts, exception list,
+    per-vendor rates, summary) or None when history is too short."""
+    cut = vt["Nag_date"].max() - pd.Timedelta(days=test_days - 1)
+    train, test = vt[vt["Nag_date"] < cut], vt[vt["Nag_date"] >= cut]
+    if train.empty or test.empty:
+        return None
+    w, sdef = vendor_windows(train, cov, min_n, step, max_width)
+    t = (test.merge(w[["Vendor_code", "Supply_Time", "lo", "hi"]],
+                    on=["Vendor_code", "Supply_Time"], how="left")
+             .merge(sdef.rename(columns={"lo": "slo", "hi": "shi"}),
+                    on="Supply_Time", how="left"))
+    t["lo"], t["hi"] = t["lo"].fillna(t["slo"]), t["hi"].fillna(t["shi"])
+    t = t.dropna(subset=["lo", "hi"])
+    t["Status"] = np.select([t["offset_min"] < t["lo"], t["offset_min"] > t["hi"]],
+                            ["Early", "Late"], "In window")
+    t["Minutes outside"] = np.where(t["Status"] == "Early", t["lo"] - t["offset_min"],
+                                    np.where(t["Status"] == "Late",
+                                             t["offset_min"] - t["hi"], 0)).round()
+    days = pd.date_range(test["Nag_date"].min(), test["Nag_date"].max(), freq="D")
+    exc = t[t["Status"] != "In window"]
+    per_day = (exc.groupby(["Nag_date", "Status"]).size().unstack(fill_value=0)
+                  .reindex(days, fill_value=0))
+    for c in ("Early", "Late"):
+        if c not in per_day:
+            per_day[c] = 0
+    per_day["Exceptions"] = per_day["Early"] + per_day["Late"]
+    per_day["Trucks"] = t.groupby("Nag_date").size().reindex(days, fill_value=0)
+    per_day = per_day.rename_axis("Nag_date").reset_index()
+    by_v = (t.groupby("Vendor_code")
+              .agg(Trucks=("trip_key", "size"),
+                   Early=("Status", lambda x: (x == "Early").sum()),
+                   Late=("Status", lambda x: (x == "Late").sum()),
+                   **{"Worst lateness (min)": ("Minutes outside", "max")})
+              .reset_index())
+    by_v["Exception %"] = (100 * (by_v["Early"] + by_v["Late"]) / by_v["Trucks"]).round(1)
+    by_v = by_v.sort_values("Exception %", ascending=False)
+    exc = exc.assign(Arrived=exc["arrival"].dt.strftime("%d-%b %H:%M"),
+                     Window=[f"{slot_clock(a, b)} - {slot_clock(a, c)}" for a, b, c in
+                             zip(exc["Supply_Time"], exc["lo"], exc["hi"])])
+    exc = exc.sort_values("Minutes outside", ascending=False)
+    summary = {"trucks": len(t), "in_pct": 100 * (t["Status"] == "In window").mean(),
+               "typ": float(per_day["Exceptions"].median()),
+               "p90": float(per_day["Exceptions"].quantile(0.9)),
+               "late_typ": float(per_day["Late"].median()),
+               "days": len(days), "from": cut}
+    return per_day, exc, by_v, summary
+
+
+def read_critical(upload) -> set:
+    """Item codes from a CSV/Excel with an 'Item' column; if there is also a
+    'Critical' column only rows marked Y/Yes/1/True count."""
+    name = upload.name.lower()
+    x = pd.read_csv(upload) if name.endswith(".csv") else pd.read_excel(upload)
+    cols = {str(c).strip().lower(): c for c in x.columns}
+    if "item" not in cols:
+        raise ValueError("needs an 'Item' column")
+    if "critical" in cols:
+        x = x[x[cols["critical"]].astype(str).str.strip().str.lower()
+              .isin(["y", "yes", "1", "true"])]
+    return set(x[cols["item"]].astype(str).str.strip())
+
+
 def daily_features(trips: pd.DataFrame, plan: pd.DataFrame) -> pd.DataFrame:
     d = (trips.groupby("Nag_date")
               .agg(trips=("trip_key", "size")).reset_index())
@@ -467,8 +598,129 @@ def analyse(path, dr, locs, vendors, split_loc, lo, plan_q, win, bucket, core, w
         by_hour=arrival_by_bucket(df, bucket, plan_q),
         d=daily_features(trips, plan), plan_view=plan_view, p_mats=p_mats,
         p_hour=arrival_by_bucket(df, bucket, plan_q, wd), daily_tot=daily_tot,
-        bay_table=bay_table, bay_keys=bay_keys, bays_per_trip=bays_per_trip)
+        bay_table=bay_table, bay_keys=bay_keys, bays_per_trip=bays_per_trip,
+        vt=vendor_trips(df), vs_bays=bay_share(df, ["Vendor_code", "Supply_Time"]),
+        bay_load=bay_load_stats(df))
     return R
+
+
+def window_planner(R, df):
+    st.markdown("One arrival **window** per vendor and slot, from real gate-entry "
+                "history. The driver gets a single from-to time and a bay list; yard "
+                "staff decide the order on the day and handle only the exceptions.")
+    c = st.columns(5)
+    cov = c[0].select_slider("Window covers", [0.8, 0.9, 0.95], value=0.9,
+                             format_func=lambda v: f"{int(v*100)}% of trucks")
+    min_n = c[1].number_input("Min trucks for own window", 3, 100, 10)
+    step = c[2].select_slider("Round to (min)", [5, 10, 15, 30], value=15)
+    max_w = c[3].number_input("Flag windows wider than (min)", 30, 720, 180, step=30)
+    test_days = c[4].number_input("Replay: last N days", 7, 60, 14)
+    up = st.file_uploader("Critical items (CSV/Excel with an 'Item' column; optional "
+                          "'Critical' Y/N column)", type=["csv", "xlsx"])
+    crit = set()
+    if up is not None:
+        try:
+            crit = read_critical(up)
+            st.caption(f"{len(crit)} critical items loaded.")
+        except Exception as e:
+            st.error(f"Could not read critical items: {e}")
+
+    vt = R["vt"]
+    w, _ = vendor_windows(vt, cov, min_n, step, max_w)
+    w = w.merge(R["vs_bays"], on=["Vendor_code", "Supply_Time"], how="left")
+    crit_trips = set()
+    if crit:
+        cr = df[df["Item"].astype(str).isin(crit)]
+        crit_trips = set(cr["trip_key"].unique())
+        ci = (cr[["Vendor_code", "Supply_Time", "Item"]].drop_duplicates()
+                .groupby(["Vendor_code", "Supply_Time"])["Item"]
+                .agg(lambda v: ", ".join(map(str, sorted(v))[:5])).rename("Critical items")
+                .reset_index())
+        w = w.merge(ci, on=["Vendor_code", "Supply_Time"], how="left")
+    cols = ["Vendor_code", "Supply_Time", "Arrive from", "Arrive by", "Width (min)",
+            "Bays", "Trucks", "Basis", "Check"] + (["Critical items"] if crit else [])
+    sheet = w[cols].rename(columns={"Vendor_code": "Vendor", "Supply_Time": "Slot",
+                                    "Trucks": "Trucks in history"}).fillna("")
+    sheet = sheet.sort_values(["Slot", "Vendor"])
+
+    st.subheader("1. Window per vendor and slot")
+    st.dataframe(sheet, hide_index=True, width="stretch")
+    st.caption("Arrive from / by are gate-entry clock times; (+1d) = after midnight. "
+               "Bays are listed by how often that vendor's trucks stop there; no "
+               "times per bay. Wide windows usually mean one truck serves several "
+               "slots or arrives the day before: check those vendors by hand.")
+
+    st.subheader("2. Replay: would these windows have worked?")
+    rp = replay_windows(vt, cov, min_n, step, max_w, int(test_days))
+    if rp is None:
+        st.info("Not enough history before the replay period.")
+        per_day = exc = by_v = None
+    else:
+        per_day, exc, by_v, sm = rp
+        a, b, c2, d = st.columns(4)
+        a.metric("Trucks inside window", f"{sm['in_pct']:.0f}%")
+        b.metric("Exceptions on a typical day", f"{sm['typ']:.0f}")
+        c2.metric("Exceptions on a bad day (P90)", f"{sm['p90']:.0f}")
+        d.metric("Late arrivals, typical day", f"{sm['late_typ']:.0f}")
+        st.caption(f"Windows fitted on data before {sm['from']:%d-%b-%Y}, then "
+                   f"checked against the last {sm['days']} days ({sm['trucks']} "
+                   "trucks) they hadn't seen. If a bad day's exceptions are more than "
+                   "your yard can handle, widen the window or move the vendor.")
+        st.markdown("**Vendors with the most exceptions**")
+        st.dataframe(by_v.head(15), hide_index=True, width="stretch")
+        with st.expander("Every exception in the replay"):
+            e = exc[["Nag_date", "Supply_Time", "Vendor_code", "Status", "Arrived",
+                     "Window", "Minutes outside"]].copy()
+            e["Nag_date"] = e["Nag_date"].dt.date
+            if crit:
+                e["Carries critical item"] = np.where(
+                    exc["trip_key"].isin(crit_trips), "YES", "")
+            st.dataframe(e.head(500), hide_index=True, width="stretch")
+
+    st.subheader("3. Bays that run hot")
+    k1, k2 = st.columns(2)
+    cap = k1.number_input("Trucks one bay can take per hour", 0.5, 10.0, 2.0, step=0.5)
+    thr = k2.slider("Flag when busy-day load is above (% of capacity)", 50, 120, 80)
+    bl = R["bay_load"].copy()
+    bl["Busy-day load %"] = (100 * bl["P90 trucks/hr"] / cap).round()
+    hot = bl[bl["Busy-day load %"] >= thr].sort_values("Busy-day load %", ascending=False)
+    if hot.empty:
+        st.success("No bay-hour above the threshold.")
+    else:
+        st.dataframe(hot, hide_index=True, width="stretch")
+    st.caption("Counts trucks entering the gate for each bay per hour: a stand-in "
+               "for bay load because bay-in/out times aren't in the data. Capacity "
+               "is your own estimate.")
+
+    st.subheader("4. Yard rules")
+    st.markdown(RULES)
+    if st.button("Prepare yard sheet"):
+        sheets = {"Windows": sheet, "Yard rules": pd.DataFrame({"Rule": RULES_LIST}),
+                  "Hot bays": hot}
+        if per_day is not None:
+            sheets["Replay by day"] = per_day.assign(
+                Nag_date=per_day["Nag_date"].dt.date)
+            sheets["Replay by vendor"] = by_v
+        st.session_state["yard"] = to_excel(sheets)
+    if "yard" in st.session_state:
+        st.download_button("Download yard sheet", st.session_state["yard"],
+                           file_name="yard_windows.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet")
+
+
+RULES_LIST = [
+    "Truck inside its window: unload at the first free bay from its bay list.",
+    "Early truck: hold in the yard; unload sooner only if a listed bay is free.",
+    "Late truck (past the window end): serve at the next free bay after the trucks "
+    "already waiting, but ahead of any truck without critical items.",
+    "Truck carrying a critical item: always served first, whatever its arrival order.",
+    "No-show: if a truck has not arrived 60 minutes after its window ends, release "
+    "its bay and re-queue the truck on arrival.",
+    "Log every exception with a reason (vendor late, breakdown, wrong slot, other) "
+    "so the windows can be re-tuned each week.",
+]
+RULES = "\n".join(f"- {r}" for r in RULES_LIST)
 
 
 def day_bays(df: pd.DataFrame, day) -> pd.DataFrame:
@@ -553,9 +805,12 @@ def main():
         st.warning("Less than ~5 months of data in range: seasonality and "
                    "month-end effects are unreliable.")
 
-    tp, t1, t2, t4, t5, t3 = st.tabs(
-        ["PLAN", "Trips per supply time", "Gate entry vs supply time",
+    tp, tw, t1, t2, t4, t5, t3 = st.tabs(
+        ["PLAN", "Window planner", "Trips per supply time", "Gate entry vs supply time",
          "Materials per slot", "Day detail", "What drives trips up"])
+
+    with tw:
+        window_planner(R, df)
 
     with tp:
         who = "all days" if not wd else "/".join(plan_days)
