@@ -160,7 +160,7 @@ def build_lines(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_item_days(lines: pd.DataFrame) -> pd.DataFrame:
     """One row per item per day + slot (lines of the same item merged)."""
-    keys = ["Nag_date", "Supply_Time", "Item", "Item_name"]
+    keys = ["Nag_date", "Supply_Time", "vendor", "Item", "Item_name"]
     out = (lines.groupby(keys)
                 .agg(planned=("planned", "sum"), received=("received", "sum"),
                      trucks=("trucks", "sum"), first_entry=("first_entry", "min"))
@@ -169,13 +169,13 @@ def build_item_days(lines: pd.DataFrame) -> pd.DataFrame:
     pj = sp.groupby(keys)["parts"].agg("; ".join).rename("parts")
     out = out.merge(pj, on=keys, how="left")
     out["parts"] = out["parts"].fillna("")
-    return out
+    return out.rename(columns={"vendor": "Vendor_code"})
 
 
 def slot_materials(iday: pd.DataFrame, slot_keys, core_pct) -> pd.DataFrame:
     """What arrives in each slot: per slot x item, how often it shows up, how
     much it brings, and how often it comes in parts."""
-    gk = slot_keys + ["Item", "Item_name"]
+    gk = slot_keys + ["Vendor_code", "Item", "Item_name"]
     x = iday.assign(_split=iday["parts"] != "",
                     received=iday["received"].fillna(0))
     g = x.groupby(gk)
@@ -202,8 +202,8 @@ def slot_materials(iday: pd.DataFrame, slot_keys, core_pct) -> pd.DataFrame:
     cols = gk + ["Days seen", "Qty/day median", "Qty/day P90", "Typical parts",
                  "Came in parts %", "Last split seen", "% of slot days",
                  "Share of slot qty %", "Core item"]
-    return (out[cols].sort_values(slot_keys + ["Days seen"],
-                                  ascending=[True] * len(slot_keys) + [False])
+    return (out[cols].sort_values(slot_keys + ["Vendor_code", "Days seen"],
+                                  ascending=[True] * (len(slot_keys) + 1) + [False])
                      .reset_index(drop=True))
 
 
@@ -226,21 +226,17 @@ def slot_bays(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def item_info(df: pd.DataFrame) -> pd.DataFrame:
-    """Per slot x item: vendors, and the bays it was unloaded at (% of the
-    days it came). Built from de-duplicated rows, so it stays quick."""
-    k = ["Supply_Time", "Item"]
-    vend = (df[k + ["Vendor_code"]].drop_duplicates().sort_values(k + ["Vendor_code"])
-              .groupby(k)["Vendor_code"].agg(", ".join).str.slice(0, 40)
-              .rename("Vendors"))
+    """Per slot x vendor x item: the bays it was unloaded at (% of the days it
+    came). Built from de-duplicated rows, so it stays quick."""
+    k = ["Supply_Time", "Vendor_code", "Item"]
     days = df.groupby(k)["Nag_date"].nunique().rename("n")
     at = (df.groupby(k + ["unloading_loc"])["Nag_date"].nunique()
             .rename("d").reset_index().merge(days.reset_index(), on=k))
     at["pct"] = 100 * at["d"] / at["n"]
-    at = at[at["pct"] >= 10].sort_values(k + ["pct"], ascending=[True, True, False])
+    at = at[at["pct"] >= 10].sort_values(k + ["pct"], ascending=[True] * 3 + [False])
     at = at.groupby(k).head(5)
     at["txt"] = at["unloading_loc"].astype(str) + " " + at["pct"].round().astype(int).astype(str) + "%"
-    bays = at.groupby(k)["txt"].agg(", ".join).rename("Bays (% of days)")
-    return pd.concat([vend, bays], axis=1).reset_index()
+    return at.groupby(k)["txt"].agg(", ".join).rename("Bays (% of days)").reset_index()
 
 
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300",
@@ -895,7 +891,7 @@ def analyse(path, dr, locs, vendors, split_loc, lo, plan_q, win, bucket, core, w
     wk = wk.reindex(columns=[w for w in WEEKDAYS if w in wk.columns]).reset_index()
     info = item_info(df)
     mats = slot_materials(iday, slot_keys, core).merge(
-        info, on=["Supply_Time", "Item"], how="left")
+        info, on=["Supply_Time", "Vendor_code", "Item"], how="left")
 
     h_sd = sd if not wd else sd[sd["Nag_date"].dt.dayofweek.isin(wd)]
     h_iday = iday if not wd else iday[iday["Nag_date"].dt.dayofweek.isin(wd)]
@@ -905,23 +901,22 @@ def analyse(path, dr, locs, vendors, split_loc, lo, plan_q, win, bucket, core, w
     p_slots = trip_plan(h_sd, slot_keys, lo, plan_q)
     p_aw = arrival_window(h_trips, slot_keys, *win)
     p_mats = slot_materials(h_iday, slot_keys, core).merge(
-        p_info, on=["Supply_Time", "Item"], how="left")
+        p_info, on=["Supply_Time", "Vendor_code", "Item"], how="left")
     p_bays = slot_bays(h_df)
 
-    plan_view = pd.DataFrame()
-    if not p_slots.empty:
-        plan_view = p_slots.merge(p_aw, on=slot_keys, how="left")
-        for col, src in (("Gate entry from", "Early edge (min)"),
-                         ("Median gate entry", "Median (min)"),
-                         ("Gate entry by", "Late edge (min)")):
-            plan_view[col] = [slot_clock(a, b) if pd.notna(b) else ""
-                              for a, b in zip(plan_view["Supply_Time"], plan_view[src])]
-        plan_view = plan_view.merge(p_bays, on="Supply_Time", how="left")
-        plan_view = plan_view[slot_keys + ["Plan for", "Typical", "Min", "Max seen",
-                                           "Days run", "Gate entry from",
-                                           "Median gate entry", "Gate entry by",
-                                           "Bays to stop at", "Bays per truck"]]
-        plan_view = plan_view.rename(columns={"Plan for": "Trips to plan"})
+    plan_view = make_plan_view(p_slots, p_aw, p_bays, slot_keys,
+                               ["Bays to stop at", "Bays per truck"])
+
+    # same plan per vendor: trucks per vendor and slot, their window and bays
+    vkeys = ["Supply_Time", "Vendor_code"]
+    h_vt = vendor_trips(h_df)
+    vsd = (h_df.groupby(["Nag_date"] + vkeys)["trip_key"].nunique()
+               .rename("trips").reset_index())
+    p_vbays = bay_share(h_df, ["Vendor_code", "Supply_Time"]).rename(
+        columns={"Bays": "Bays to stop at"})
+    plan_view_v = make_plan_view(trip_plan(vsd, vkeys, lo, plan_q),
+                                 arrival_window(h_vt, vkeys, *win), p_vbays, vkeys,
+                                 ["Bays to stop at"])
 
     daily_tot = h_sd.groupby("Nag_date")["trips"].sum()
     if wd:
@@ -942,7 +937,7 @@ def analyse(path, dr, locs, vendors, split_loc, lo, plan_q, win, bucket, core, w
         lines=lines, trips=trips, n_days=n_days, table=table, wk=wk, mats=mats,
         aw=arrival_window(trips, slot_keys, *win),
         by_hour=arrival_by_bucket(df, bucket, plan_q),
-        d=daily_features(trips, plan), plan_view=plan_view, p_mats=p_mats,
+        d=daily_features(trips, plan), plan_view=plan_view, plan_view_v=plan_view_v, p_mats=p_mats,
         p_hour=arrival_by_bucket(df, bucket, plan_q, wd), daily_tot=daily_tot,
         bay_table=bay_table, bay_keys=bay_keys, bays_per_trip=bays_per_trip,
         vt=vendor_trips(df), vs_bays=bay_share(df, ["Vendor_code", "Supply_Time"]),
@@ -1358,6 +1353,22 @@ RULES_LIST = [
 RULES = "\n".join(f"- {r}" for r in RULES_LIST)
 
 
+def make_plan_view(slots, aw, bays, keys, bay_cols):
+    """Trips to plan + gate-entry window (clock times) + bays, per `keys`."""
+    if slots.empty:
+        return pd.DataFrame()
+    v = slots.merge(aw, on=keys, how="left")
+    for col, src in (("Gate entry from", "Early edge (min)"),
+                     ("Median gate entry", "Median (min)"),
+                     ("Gate entry by", "Late edge (min)")):
+        v[col] = [slot_clock(a, b) if pd.notna(b) else ""
+                  for a, b in zip(v["Supply_Time"], v[src])]
+    v = v.merge(bays, on=keys, how="left")
+    v = v[keys + ["Plan for", "Typical", "Min", "Max seen", "Days run", "Gate entry from",
+                  "Median gate entry", "Gate entry by"] + bay_cols]
+    return v.rename(columns={"Plan for": "Trips to plan"})
+
+
 def day_bays(df: pd.DataFrame, day) -> pd.DataFrame:
     """Bays per schedule line for one day (only computed for the day shown)."""
     x = df[df["Nag_date"].dt.date == day]
@@ -1369,7 +1380,7 @@ def day_bays(df: pd.DataFrame, day) -> pd.DataFrame:
 
 def build_excel(R, wd_label, include_lines) -> bytes:
     sheets = {"Plan": R["plan_view"], "Plan arrivals by hour": R["p_hour"],
-              "Plan materials": R["p_mats"], "Trips per slot": R["table"],
+              "Plan by vendor": R["plan_view_v"], "Plan materials": R["p_mats"], "Trips per slot": R["table"],
               "Arrival window": R["aw"], "Materials per slot": R["mats"]}
     if len(R["bay_table"]):
         sheets["Bay visits"] = R["bay_table"]
@@ -1465,6 +1476,15 @@ def main():
                    "Gate entry columns are clock times from real gate-entry history "
                    "relative to the slot; (+1d) means after midnight. Slot totals "
                    "overstate the day total because slots rarely all peak together.")
+        st.subheader("1b. The same, per vendor")
+        pv = R["plan_view_v"]
+        vsel = st.multiselect("Vendor", sorted(pv["Vendor_code"].astype(str).unique()),
+                              key="plan_v")
+        pv = pv[pv["Vendor_code"].astype(str).isin(vsel)] if vsel else pv
+        st.dataframe(pv.sort_values(["Supply_Time", "Vendor_code"]), hide_index=True,
+                     width="stretch")
+        st.caption("Trucks and gate-entry window for each vendor within each slot. A vendor "
+                   "with few trucks has a thin history, so treat its window loosely.")
         st.subheader("2. Trucks to expect at the gate by clock time")
         p_hour = R["p_hour"]
         st.dataframe(p_hour[p_hour["Max seen"] > 0], hide_index=True, width="stretch")
@@ -1472,6 +1492,9 @@ def main():
         only_core = st.checkbox("Core items only", value=True)
         p_mats = R["p_mats"]
         pm = p_mats[p_mats["Core item"] == "yes"] if only_core else p_mats
+        pvs = st.multiselect("Vendor", sorted(pm["Vendor_code"].astype(str).unique()),
+                             key="mat_v")
+        pm = pm[pm["Vendor_code"].astype(str).isin(pvs)] if pvs else pm
         st.dataframe(pm.drop(columns=["Core item"]), hide_index=True, width="stretch")
         st.caption("Came in parts % = share of days the item arrived on more than one "
                    "truck. Last split seen is received/planned per truck in gate "
@@ -1524,6 +1547,9 @@ def main():
         mats = R["mats"]
         pick = st.selectbox("Supply time", ["All"] + sorted(mats["Supply_Time"].unique()))
         view = mats if pick == "All" else mats[mats["Supply_Time"] == pick]
+        mv = st.multiselect("Vendor", sorted(view["Vendor_code"].astype(str).unique()),
+                            key="mats_v")
+        view = view[view["Vendor_code"].astype(str).isin(mv)] if mv else view
         if pick != "All":
             st.metric("Core items expected", int((view["Core item"] == "yes").sum()))
         st.dataframe(view, hide_index=True, width="stretch")
@@ -1540,8 +1566,9 @@ def main():
             "Supply_Time": "Supply time", "planned": "Planned", "received": "Received",
             "trucks": "Trucks", "first_entry": "First gate entry",
             "last_entry": "Last gate entry", "parts": "Parts", "vendor": "Vendor"})
-        st.dataframe(dl.drop(columns=["Nag_date", "Schedule_no"]), hide_index=True,
-                     width="stretch")
+        dl = dl.drop(columns=["Nag_date", "Schedule_no"])
+        dl = dl[["Vendor"] + [c for c in dl.columns if c != "Vendor"]]
+        st.dataframe(dl, hide_index=True, width="stretch")
         st.caption("Parts = received/planned per truck, in gate-entry order.")
 
     with t3:
