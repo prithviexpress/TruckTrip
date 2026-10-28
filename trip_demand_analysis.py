@@ -124,6 +124,7 @@ def arrival_window(trips: pd.DataFrame, group_cols, lo, hi) -> pd.DataFrame:
                      "Trucks": len(o),
                      "Early edge (min)": round(o.quantile(lo)),
                      "Median (min)": round(o.median()),
+                     "P90 (min)": round(o.quantile(0.9)),
                      "Late edge (min)": round(o.quantile(hi)),
                      "% before slot": round(100 * (o <= 0).mean()),
                      "% >60 min late": round(100 * (o > 60).mean())})
@@ -904,8 +905,9 @@ def analyse(path, dr, locs, vendors, split_loc, lo, plan_q, win, bucket, core, w
         p_info, on=["Supply_Time", "Vendor_code", "Item"], how="left")
     p_bays = slot_bays(h_df)
 
+    by_is_p90 = abs(win[1] - 0.9) < 1e-9     # late edge would just repeat the P90 column
     plan_view = make_plan_view(p_slots, p_aw, p_bays, slot_keys,
-                               ["Bays to stop at", "Bays per truck"])
+                               ["Bays to stop at", "Bays per truck"], by_is_p90)
 
     # same plan per vendor: trucks per vendor and slot, their window and bays
     vkeys = ["Supply_Time", "Vendor_code"]
@@ -916,7 +918,7 @@ def analyse(path, dr, locs, vendors, split_loc, lo, plan_q, win, bucket, core, w
         columns={"Bays": "Bays to stop at"})
     plan_view_v = make_plan_view(trip_plan(vsd, vkeys, lo, plan_q),
                                  arrival_window(h_vt, vkeys, *win), p_vbays, vkeys,
-                                 ["Bays to stop at"])
+                                 ["Bays to stop at"], by_is_p90)
 
     daily_tot = h_sd.groupby("Nag_date")["trips"].sum()
     if wd:
@@ -1353,19 +1355,20 @@ RULES_LIST = [
 RULES = "\n".join(f"- {r}" for r in RULES_LIST)
 
 
-def make_plan_view(slots, aw, bays, keys, bay_cols):
+def make_plan_view(slots, aw, bays, keys, bay_cols, drop_by=False):
     """Trips to plan + gate-entry window (clock times) + bays, per `keys`."""
     if slots.empty:
         return pd.DataFrame()
     v = slots.merge(aw, on=keys, how="left")
     for col, src in (("Gate entry from", "Early edge (min)"),
-                     ("Median gate entry", "Median (min)"),
+                     ("P90 gate entry", "P90 (min)"),
                      ("Gate entry by", "Late edge (min)")):
         v[col] = [slot_clock(a, b) if pd.notna(b) else ""
                   for a, b in zip(v["Supply_Time"], v[src])]
     v = v.merge(bays, on=keys, how="left")
-    v = v[keys + ["Plan for", "Typical", "Min", "Max seen", "Days run", "Gate entry from",
-                  "Median gate entry", "Gate entry by"] + bay_cols]
+    cols = ["Plan for", "Typical", "Min", "Max seen", "Days run", "Gate entry from",
+            "P90 gate entry"] + ([] if drop_by else ["Gate entry by"]) + bay_cols
+    v = v[keys + cols]
     return v.rename(columns={"Plan for": "Trips to plan"})
 
 
