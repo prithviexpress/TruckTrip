@@ -520,8 +520,59 @@ def replay_habit(vt, q_start, q_stop, grace, min_n, step, test_days):
     return sm, wd.sort_values("Minutes after stop", ascending=False)
 
 
+STD_BASES = ["per pack", "per piece", "per item per stop"]
+
+
+def guess_col(cols, words, default=0):
+    for i, c in enumerate(cols):
+        if any(w in str(c).lower() for w in words):
+            return i
+    return default
+
+
+def read_table(upload) -> pd.DataFrame:
+    name = upload.name.lower()
+    return pd.read_csv(upload) if name.endswith(".csv") else pd.read_excel(upload)
+
+
+def std_stop_minutes(ibd, std, item_col, pack_col, time_col, basis, allow_pct,
+                     fixed_min, q, weekday, step=5):
+    """Minutes for each vendor + slot + bay stop from your unloading standards:
+    packs (qty / pack size) x standard time, plus allowance % and a fixed
+    minutes per stop. Sized on the q-th percentile of past days. Returns
+    (per-bay minutes with % of qty that had a standard, items with no standard)."""
+    sd = std[[item_col, pack_col, time_col]].copy()
+    sd.columns = ["Item", "pack", "t"]
+    sd["Item"] = sd["Item"].astype(str).str.strip()
+    sd["pack"] = pd.to_numeric(sd["pack"], errors="coerce")
+    sd["t"] = pd.to_numeric(sd["t"], errors="coerce")
+    sd = sd.drop_duplicates("Item")
+    x = ibd if weekday is None else ibd[ibd["Nag_date"].dt.dayofweek == weekday]
+    x = x.assign(Item=x["Item"].astype(str)).merge(sd, on="Item", how="left")
+    qty = x["Received_qty"].fillna(0)
+    if basis == "per pack":
+        mins = np.ceil(qty / x["pack"].where(x["pack"] > 0)) * x["t"]
+    elif basis == "per piece":
+        mins = qty * x["t"]
+    else:
+        mins = x["t"].where(qty > 0)
+    x = x.assign(mins=mins.fillna(0), q_std=qty.where(mins.notna(), 0), qty=qty)
+    missing = (x[mins.isna()].groupby("Item")["qty"].sum().sort_values(ascending=False)
+                 .rename("Qty without standard").reset_index())
+    k = ["Vendor_code", "Supply_Time", "unloading_loc"]
+    day = (x.groupby(k + ["Nag_date"])
+             .agg(mins=("mins", "sum"), q_std=("q_std", "sum"), qty=("qty", "sum"))
+             .reset_index())
+    g = day.groupby(k)
+    out = g["mins"].quantile(q).rename("raw").to_frame()
+    out["coverage"] = (100 * g["q_std"].sum() / g["qty"].sum().replace(0, np.nan)).round()
+    out["std_min"] = (np.ceil((out["raw"] * (1 + allow_pct / 100) + fixed_min) / step)
+                      * step).astype(int)
+    return out.reset_index().drop(columns="raw"), missing
+
+
 def build_bay_schedule(plan: pd.DataFrame, bays: pd.DataFrame, crit_bays: set,
-                       gap: int) -> pd.DataFrame:
+                       gap: int, dur: dict = None) -> pd.DataFrame:
     """Indicative bay windows. Each vendor + slot visits its bays in order
     (critical bays first, then most-used) starting at its safe start. A bay is
     held by one truck at a time, so a stop is pushed back when the bay is still
@@ -542,12 +593,16 @@ def build_bay_schedule(plan: pd.DataFrame, bays: pd.DataFrame, crit_bays: set,
         cursor = r.abs_start
         for i, b in enumerate(g.itertuples(), start=1):
             bay = str(b.unloading_loc)
+            own = (dur or {}).get((r.Vendor_code, r.Supply_Time, bay))
+            mins = own if own else r.mins
             begin = max(cursor, free.get(bay, -1e9))
-            end = begin + r.mins
+            end = begin + mins
             free[bay] = end + gap
             rows.append({"Vendor": r.Vendor_code, "Slot": r.Supply_Time, "Stop": i,
                          "Bay": bay, "From": slot_clock("00:00", begin),
                          "To": slot_clock("00:00", end),
+                         "Min": int(mins),
+                         "Minutes basis": "Your standard" if own else r.basis,
                          "Pushed (min)": int(begin - cursor),
                          "Critical bay": "YES" if b.crit else ""})
             cursor = end + gap
@@ -724,6 +779,8 @@ def analyse(path, dr, locs, vendors, split_loc, lo, plan_q, win, bucket, core, w
         vt=vendor_trips(df), vs_bays=bay_share(df, ["Vendor_code", "Supply_Time"]),
         vs_bay_rows=bay_share_rows(df, ["Vendor_code", "Supply_Time"]),
         stop_min=stop_minutes(df),
+        ibd=(df.groupby(["Vendor_code", "Supply_Time", "unloading_loc", "Item", "Nag_date"])
+               ["Received_qty"].sum().reset_index()),
         bay_load=bay_load_stats(df))
     return R
 
@@ -758,12 +815,44 @@ def bay_schedule_tab(R, df):
     step = a[4].select_slider("Round to (min)", [5, 15, 30], value=15, key="bs_step")
     b = st.columns(5)
     min_n = b[0].number_input("Min trucks for own timing", 3, 100, 10, key="bs_minn")
-    mode = b[1].radio("Minutes per bay stop", ["Manual", "Observed"], horizontal=True)
+    mode = b[1].radio("Minutes per bay stop", ["Manual", "Observed", "Your standards"],
+                      horizontal=True)
     manual = b[2].number_input("Manual minutes per stop", 5, 90, 25)
     gap = b[3].number_input("Gap between stops (min)", 0, 30, 5)
     min_run = b[4].number_input("Include vendors running on at least (% days)", 0, 100, 20)
     test_days = st.number_input("Replay: last N days", 7, 60, 14, key="bs_test")
     crit = critical_input("crit_bay")
+    std_res = None
+    with st.expander("Unloading standards: pack size, unload time, allowances",
+                     expanded=(mode == "Your standards")):
+        su = st.file_uploader("Standards file (CSV/Excel: one row per item with pack "
+                              "size and unloading time)", type=["csv", "xlsx"], key="std_up")
+        if su is not None:
+            try:
+                st.session_state["std_df"] = read_table(su)
+            except Exception as e:
+                st.error(f"Could not read standards: {e}")
+        sdf = st.session_state.get("std_df")
+        if sdf is not None:
+            cols = list(sdf.columns)
+            m = st.columns(4)
+            ic = m[0].selectbox("Item column", cols, index=guess_col(cols, ["item", "part"]))
+            pc = m[1].selectbox("Pack size column", cols,
+                                index=guess_col(cols, ["pack", "snp", "qty"], 1 % len(cols)))
+            tc = m[2].selectbox("Unloading time column (minutes)", cols,
+                                index=guess_col(cols, ["time", "min", "std"], 2 % len(cols)))
+            basis = m[3].selectbox("Time is", STD_BASES)
+            n = st.columns(3)
+            allow = n[0].number_input("Allowance (% on top)", 0, 100, 15)
+            fixed = n[1].number_input("Fixed minutes per stop (positioning, paperwork)",
+                                      0, 60, 5)
+            sq = n[2].select_slider("Size stop on", [0.5, 0.75, 0.9], value=0.75,
+                                    format_func=lambda v: f"P{int(v*100)} of past days")
+            st.session_state["std_cfg"] = (ic, pc, tc, basis, allow, fixed, sq)
+            st.caption(f"{len(sdf)} items in the standards file.")
+        else:
+            st.caption("Upload a file to size each bay stop from pack size and standard "
+                       "time instead of the manual or observed minutes.")
 
     vt = R["vt"]
     n_days = df["Nag_date"].nunique()
@@ -789,6 +878,27 @@ def bay_schedule_tab(R, df):
     if mode == "Observed" and sm_.empty:
         st.warning("No Gate_Out_time in the data, so the manual minutes are used.")
     plan = w[w["Runs on % of days"] >= min_run].copy()
+    plan["basis"] = plan["Minutes basis"]
+    dur = {}
+    if mode == "Your standards":
+        sdf, cfg = st.session_state.get("std_df"), st.session_state.get("std_cfg")
+        if sdf is None or cfg is None:
+            st.warning("No standards loaded yet: using the manual minutes.")
+        else:
+            wday = None if day_pick == "All days" else WEEKDAYS.index(day_pick)
+            stdm, missing = std_stop_minutes(R["ibd"], sdf, *cfg[:3], cfg[3], cfg[4],
+                                             cfg[5], cfg[6], wday)
+            ok = stdm[stdm["coverage"] >= 50]
+            dur = {(str(a), str(b), str(c)): int(d) for a, b, c, d in
+                   zip(ok["Vendor_code"], ok["Supply_Time"], ok["unloading_loc"],
+                       ok["std_min"])}
+            share = len(ok) / max(len(stdm), 1)
+            st.caption(f"Standards cover {share:.0%} of vendor-slot-bay stops "
+                       "(>= 50% of their quantity). Stops without enough coverage use "
+                       "the manual minutes.")
+            if len(missing):
+                with st.expander(f"{len(missing)} items have no usable standard"):
+                    st.dataframe(missing.head(50), hide_index=True, width="stretch")
 
     rows = R["vs_bay_rows"]
     rows = rows.merge(plan[["Vendor_code", "Supply_Time"]], on=["Vendor_code", "Supply_Time"])
@@ -801,7 +911,7 @@ def bay_schedule_tab(R, df):
                                            Supply_Time=plan["Supply_Time"].astype(str)),
                                rows.assign(Vendor_code=rows["Vendor_code"].astype(str),
                                            Supply_Time=rows["Supply_Time"].astype(str)),
-                               crit_bays, int(gap))
+                               crit_bays, int(gap), dur)
 
     head = plan.assign(**{
         "Safe start": [slot_clock(a_, b_) for a_, b_ in zip(plan["Supply_Time"], plan["start"])],
@@ -865,7 +975,8 @@ def bay_schedule_tab(R, df):
         hrow = head[(head["Vendor"] == pv) & (head["Slot"] == ps)].iloc[0]
         st.markdown(f"**{pv}**, slot {ps}: safe start **{hrow['Safe start']}**, hard stop "
                     f"**{hrow['Hard stop (withdraw slot)']}**")
-        st.dataframe(card[["Stop", "Bay", "From", "To", "Pushed (min)", "Critical bay"]],
+        st.dataframe(card[["Stop", "Bay", "From", "To", "Min", "Minutes basis",
+                           "Pushed (min)", "Critical bay"]],
                      hide_index=True, width="stretch")
         with st.expander("All indicative windows"):
             st.dataframe(sched, hide_index=True, width="stretch")
