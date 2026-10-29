@@ -149,6 +149,18 @@ create persistent entity TripPlanning.HistTrip (
 )
 index (Vendor, Slot, OffsetMin);
 
+/** Gate entries left out of the plan, and why: look here when a vendor seems missing */
+@position(100, 950)
+create persistent entity TripPlanning.HistDrop (
+  Vendor: string(20),
+  Slot: string(5),
+  SupplyDate: datetime,
+  TruckId: string(30),
+  GateIn: datetime,
+  OffsetMin: integer,
+  Reason: string(100)
+);
+
 /** One bay stop of a gate entry, with standard unloading minutes */
 @position(400, 700)
 create persistent entity TripPlanning.HistStop (
@@ -342,6 +354,8 @@ begin
   delete $OldTrips;
   retrieve $OldStops from TripPlanning.HistStop;
   delete $OldStops;
+  retrieve $OldDrops from TripPlanning.HistDrop;
+  delete $OldDrops;
   retrieve $Standards from TripPlanning.ItemStandard;
 
   declare $From datetime = addDays([%CurrentDateTime%], -7 * $Settings/HistoryWeeks);
@@ -400,6 +414,17 @@ begin
           else
             set $Trip = empty;
             set $Dropped = $Dropped + 1;
+            $NewDrop = create TripPlanning.HistDrop (
+              Vendor = $Row/Vendor,
+              Slot = $Row/Slot,
+              SupplyDate = $Row/SupplyDate,
+              TruckId = $Row/TruckId,
+              GateIn = $Row/GateIn,
+              OffsetMin = $Off,
+              Reason = 'Arrived ' + toString($Off) + ' min from the slot, outside the '
+                + toString($Settings/EarlyCapH) + 'h before / ' + toString($Settings/LateCapH) + 'h after limit'
+            );
+            commit $NewDrop;
           end if;
         end if;
 
@@ -473,7 +498,7 @@ end;
 
 /** Step 2: trips per vendor + slot, per slot, bay usage, and days with any trucks.
  *  Returns the number of distinct days. */
-create microflow TripPlanning.SUB_BuildGroups ()
+create microflow TripPlanning.SUB_BuildGroups ($Version: integer)
 returns integer as $AllDays
 folder 'Plan'
 begin
@@ -490,6 +515,8 @@ begin
   declare $LastV string = '';
   declare $LastS string = '';
   declare $LastD datetime = empty;
+  declare $NGroups integer = 0;
+  declare $NBays integer = 0;
   loop $T in $Trips begin
     if $T/Vendor != $LastV or $T/Slot != $LastS then
       if $G != empty then
@@ -497,6 +524,7 @@ begin
       end if;
       $NewG = create TripPlanning.VsGroup (Vendor = $T/Vendor, Slot = $T/Slot, N = 0, RunDays = 0);
       set $G = $NewG;
+      set $NGroups = $NGroups + 1;
       set $LastV = $T/Vendor;
       set $LastS = $T/Slot;
       set $LastD = empty;
@@ -554,6 +582,7 @@ begin
       end if;
       $NewBS = create TripPlanning.BayShare (Vendor = $St/Vendor, Slot = $St/Slot, Bay = $St/Bay);
       set $BS = $NewBS;
+      set $NBays = $NBays + 1;
       set $LastV = $St/Vendor;
       set $LastS = $St/Slot;
       set $LastB = $St/Bay;
@@ -568,6 +597,12 @@ begin
   if $BS != empty then
     commit $BS;
   end if;
+  call microflow TripPlanning.SUB_RunLog (
+    Version = $Version,
+    Scope = 'run',
+    Message = toString($NGroups) + ' vendor-slot groups, ' + toString($NBays)
+      + ' vendor-slot-bay combinations, trucks on ' + toString($Days) + ' distinct days.'
+  );
   return $Days;
 end;
 
@@ -590,6 +625,8 @@ begin
   declare $Hard integer = 0;
   declare $Seq integer = 0;
   declare $Mins integer = 0;
+  declare $Pct decimal = 0;
+  declare $MinsText string = '';
   declare $MinsBasis string = '';
   declare $Scope string = '';
   declare $BasisText string = '';
@@ -653,17 +690,29 @@ begin
         sort by HasCritical desc, Visits desc;
       set $Seq = 0;
       loop $Sh in $Shares begin
-        if $Seq < 5 and 100.0 * $Sh/Visits / $Gp/N >= 10 then
+        set $Pct = 100.0 * $Sh/Visits / $Gp/N;
+        if $Seq < 5 and $Pct >= 10 then
           set $Seq = $Seq + 1;
           if $Sh/QtyAll > 0 and $Sh/QtyStd / $Sh/QtyAll >= 0.5 then
             $Raw = call microflow TripPlanning.SUB_PercentileStop (
               Vendor = $Gp/Vendor, Slot = $Gp/Slot, Bay = $Sh/Bay, N = $Sh/Visits, Q = $Settings/QStopMinutes);
             set $Mins = ceil(($Raw * (1 + $Settings/AllowancePct / 100.0) + $Settings/FixedMin) / 5) * 5;
             set $MinsBasis = 'Your standard';
+            set $MinsText = 'standard minutes P' + toString(round(100 * $Settings/QStopMinutes)) + ' = '
+              + toString(round($Raw)) + ', +' + toString($Settings/AllowancePct) + '% allowance, +'
+              + toString($Settings/FixedMin) + ' fixed, rounded up to 5 -> ' + toString($Mins) + ' min';
           else
             set $Mins = $Settings/ManualMin;
             set $MinsBasis = 'Manual (no standard)';
+            set $MinsText = 'standards cover only ' + toString(round(100.0 * $Sh/QtyStd / ($Sh/QtyAll + 0.000001)))
+              + '% of the quantity (needs 50%), so manual ' + toString($Mins) + ' min';
           end if;
+          call microflow TripPlanning.SUB_RunLog (
+            Version = $Version, Scope = $Scope + ' | ' + $Sh/Bay,
+            Message = 'Stop ' + toString($Seq) + ': used on ' + toString(round($Pct)) + '% of trips ('
+              + toString($Sh/Visits) + ' visits)' + (if $Sh/HasCritical then ', carries a critical part' else '')
+              + '; ' + $MinsText + '.'
+          );
           $Stop = create TripPlanning.PlanStop (
             Sequence = $Seq,
             BayCode = $Sh/Bay,
@@ -678,6 +727,12 @@ begin
             change $Stop (PlanStop_Bay = $BayObj);
           end if;
           commit $Stop;
+        else
+          call microflow TripPlanning.SUB_RunLog (
+            Version = $Version, Scope = $Scope + ' | ' + $Sh/Bay,
+            Message = 'Bay not planned: used on ' + toString(round($Pct)) + '% of trips'
+              + (if $Pct >= 10 then ', beyond the 5 bays a plan holds' else ', below the 10% threshold') + '.'
+          );
         end if;
       end loop;
     end if;
@@ -705,7 +760,7 @@ begin
   commit $Active;
 
   $Kept = call microflow TripPlanning.SUB_BuildHistory (Settings = $Cfg, Version = $Version);
-  $AllDays = call microflow TripPlanning.SUB_BuildGroups ();
+  $AllDays = call microflow TripPlanning.SUB_BuildGroups (Version = $Version);
   if $AllDays > 0 then
     $Written = call microflow TripPlanning.SUB_WritePlans (Settings = $Cfg, Version = $Version, AllDays = $AllDays);
     log info node 'TripPlanning' 'Plan version {1}: {2} plan rows' with ({1} = toString($Version), {2} = toString($Written));

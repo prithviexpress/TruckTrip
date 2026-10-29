@@ -22,19 +22,21 @@ syntax nit or two on the first run; the statement forms follow the mxcli docs an
 examples in the repo.
 
 ## Pages (third script)
-`tripplanning_pages.mdl` adds one page per thing you want to see. Apply it after the other
-two, then add the pages to the navigation in Studio Pro.
+`tripplanning_pages.mdl` adds the pages. Open **Home_TripPlanning**: it links to all of them. The
+script does not touch your navigation; set that page as home or add one menu item.
 
-| Page | Shows |
-|---|---|
-| Plan_Overview / Plan_Detail | every vendor-slot plan row, its safe start, hard stop and ordered bays |
-| PlanRun_Log | why: rows read, trips kept, percentiles used, slots skipped |
-| Trips_Board / Bays_Board | gate entries and their status; bays with occupancy and holds |
-| Allocations_Log / Exceptions_Log | who was sent where; hot trips, withdrawals, overruns |
-| Settings_*, ItemStandard_*, GateEntry_Overview | the inputs |
+| Group | Pages | Shows |
+|---|---|---|
+| Plan | Plan_Overview, Plan_History, Plan_Detail, PlanRun_Log | the plan in force and every version; each plan row's bays and minutes; **why**: rows read, trips kept, percentiles, every bay and minute decision |
+| Live | Control_Tower, Trips_Board, Bays_Board, Allocations_Log, DecisionLog_Page, Exceptions_Log | hot / waiting / at-bay / withdrawn trucks and the latest reasons; bay state; who was sent where and **why**, in plain words |
+| Inputs | Settings_*, ItemStandard_*, Bay_Edit, BayFallback_*, GateEntry_Overview | everything the plan reads |
+| Debug | HistDrop_View, HistTrip_View, HistStop_View, VsGroup_View, BayShare_View | what the last plan run actually worked with, including entries it left out and why |
 
-First step: load a small `Bay`, `ItemStandard` and `GateEntry` sample, press
-"Generate plan now" on Plan_Overview, then read PlanRun_Log.
+Explanatory logs: `PlanRunLog` (plan side) and `DecisionLog` (live side, e.g. "Stop 1: planned
+bay AR-L3 is held until 10:35; AR-L2 is occupied; AR-L4 is free: sent there instead").
+
+First step: load a small `Bay`, `ItemStandard`, `BayFallback` and `GateEntry` sample, press
+"Generate plan now" on the hub, read PlanRun_Log, then simulate a truck by calling `OnGateEntry`.
 
 ## Re-running
 The scripts create the module, so a second run fails with "already exists". To start
@@ -50,8 +52,8 @@ and ExceptionLog. Run it after `tripplanning.mdl`:
 mxcli check mendix/tripplanning_live.mdl
 mxcli -p path/to/App.mpr -c "execute script 'mendix/tripplanning_live.mdl'"
 ```
-Load `BayFallback` from `fallback_map.csv` (Download fallback map in the Bay schedule
-tab): one row per bay-fallback pair, `Rank` = position in the list.
+`BayFallback` has one row per bay and fallback (`BayCode`, `FallbackCode`, `Rank` = position in
+the list): split `fallback_map.csv` (Download fallback map in the Bay schedule tab) into rows.
 Still to wire in Studio Pro: the two integrations (truck-entry alert -> `OnGateEntry`,
 occupancy feed -> `Bay.Occupied` and `OnBayFree`) and a yard page on Trip/Allocation.
 
