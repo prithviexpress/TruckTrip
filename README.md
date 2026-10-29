@@ -21,3 +21,4 @@ Put `nagare_data.parquet` next to the scripts or enter its path in the sidebar.
 - Days come from `Nag_date`, not gate entry date.
 - Load per trip is in pieces, not volume.
 - `trip_demand_analysis.py` takes `Nag_qty` once per Schedule_no + Item line (it repeats on every truck row) and measures arrival as first gate entry minus Nag_date + Supply_Time.
+- `trip_demand_analysis.py` writes `<parquet>.cleaned.parquet` next to the source (gitignored) so later starts skip date parsing; delete it if a start looks stale. It builds only the page selected at the top, and the heavy bay tables on first use of the bay pages.
