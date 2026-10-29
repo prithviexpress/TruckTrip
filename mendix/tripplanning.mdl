@@ -1,6 +1,7 @@
 mdl 1;
 -- =============================================================================
 -- TripPlanning: safe start, hard stop, bay list and stop minutes per vendor+slot
+-- (all in microflows; no Java except the tiny MinutesFromSlot in the live script)
 -- Mirrors trip_demand_analysis.py (Bay schedule tab). Apply with mxcli:
 --
 --   mxcli check mendix/tripplanning.mdl
@@ -122,7 +123,7 @@ create association TripPlanning.PlanStop_Bay
   from TripPlanning.PlanStop to TripPlanning.Bay
   type reference;
 
-/** One line per decision GeneratePlan makes, so a plan can be explained on a page */
+/** One line per decision the plan run makes, so a plan can be explained on a page */
 @position(1000, 400)
 create persistent entity TripPlanning.PlanRunLog (
   RunAt: datetime,
@@ -133,251 +134,61 @@ create persistent entity TripPlanning.PlanRunLog (
 )
 index (PlanVersion);
 
--- MARK: JAVA ACTION ----------------------------------------------------------
+-- MARK: STAGING (rebuilt on every plan run) ----------------------------------
 
-/**
- * Computes the plan from GateEntry + ItemStandard and writes
- * VendorSlotPlan + PlanStop. Returns rows written.
- * Weekday: '' = all days, or MONDAY..SUNDAY.
- */
-create java action TripPlanning.GeneratePlan (
-  Settings: TripPlanning.PlanSettings not null,
-  Weekday: string
-) returns long
-as $$
-import java.time.DayOfWeek;
-import java.time.Duration;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.LocalTime;
-import java.time.ZoneId;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
-import java.util.stream.Collectors;
-import com.mendix.core.Core;
-import com.mendix.systemwideinterfaces.core.IContext;
-import com.mendix.systemwideinterfaces.core.IMendixObject;
-import tripplanning.proxies.GateEntry;
-import tripplanning.proxies.ItemStandard;
-import tripplanning.proxies.PlanStop;
-import tripplanning.proxies.VendorSlotPlan;
+/** One gate entry (truck + entry time) with its minutes against the slot */
+@position(100, 700)
+create persistent entity TripPlanning.HistTrip (
+  Vendor: string(20),
+  Slot: string(5),
+  SupplyDate: datetime,
+  TruckId: string(30),
+  GateIn: datetime,
+  /** Minutes after the slot time; negative = before */
+  OffsetMin: integer
+)
+index (Vendor, Slot, OffsetMin);
 
-IContext ctx = getContext();
-String wd = Weekday == null ? "" : Weekday.trim().toUpperCase();
-DayOfWeek dow = wd.isEmpty() ? null : DayOfWeek.valueOf(wd);
-LocalDate from = LocalDate.now().minusWeeks(Settings.getHistoryWeeks());
-ZoneId zone = ZoneId.systemDefault();
+/** One bay stop of a gate entry, with standard unloading minutes */
+@position(400, 700)
+create persistent entity TripPlanning.HistStop (
+  Vendor: string(20),
+  Slot: string(5),
+  Bay: string(20),
+  StdMin: decimal default 0,
+  QtyAll: decimal default 0,
+  QtyStd: decimal default 0,
+  HasCritical: boolean default false
+)
+index (Vendor, Slot, Bay, StdMin);
 
-// 1. Trips: one per truck + gate-entry time (a returning truck is a new trip)
-Map<String, Trip> trips = new HashMap<>();
-long rowsRead = 0;
-for (IMendixObject o : Core.retrieveXPathQuery(ctx,
-        "//TripPlanning.GateEntry[SupplyDate >= '" + from + "']")) {
-    rowsRead++;
-    GateEntry g = GateEntry.initialize(ctx, o);
-    if (g.getGateIn() == null || g.getSupplyDate() == null || g.getSlot() == null) continue;
-    LocalDate d = g.getSupplyDate().toInstant().atZone(zone).toLocalDate();
-    if (dow != null && d.getDayOfWeek() != dow) continue;
-    LocalDateTime in = LocalDateTime.ofInstant(g.getGateIn().toInstant(), zone);
-    Trip t = trips.computeIfAbsent(g.getTruckId() + "@" + in, k -> new Trip());
-    t.vendor = g.getVendor();
-    t.slot = g.getSlot();
-    t.date = d;
-    t.offset = Duration.between(d.atTime(LocalTime.parse(g.getSlot())), in).toMinutes();
-    if (g.getBay() != null) {
-        t.bays.add(g.getBay());
-        double q = g.getReceivedQty() == null ? 0 : g.getReceivedQty().doubleValue();
-        t.qty.computeIfAbsent(g.getBay(), k -> new HashMap<>()).merge(g.getItem(), q, Double::sum);
-    }
-}
-double earlyCap = -Settings.getEarlyCapH() * 60.0, lateCap = Settings.getLateCapH() * 60.0;
-List<Trip> kept = trips.values().stream()
-    .filter(t -> t.offset >= earlyCap && t.offset <= lateCap).collect(Collectors.toList());
-long allDays = kept.stream().map(t -> t.date).distinct().count();
+/** Trips per vendor + slot, and on how many days they ran */
+@position(700, 700)
+create persistent entity TripPlanning.VsGroup (
+  Vendor: string(20),
+  Slot: string(5),
+  N: integer default 0,
+  RunDays: integer default 0
+);
 
-Map<String, ItemStandard> std = new HashMap<>();
-for (IMendixObject o : Core.retrieveXPathQuery(ctx, "//TripPlanning.ItemStandard")) {
-    ItemStandard is = ItemStandard.initialize(ctx, o);
-    std.put(is.getItem(), is);
-}
-Map<String, List<Double>> bySlot = new HashMap<>();
-for (Trip t : kept) bySlot.computeIfAbsent(t.slot, k -> new ArrayList<>()).add(t.offset);
+/** Trips per slot over all vendors: the fallback for thin vendor history */
+@position(1000, 700)
+create persistent entity TripPlanning.SlotGroup (
+  Slot: string(5),
+  N: integer default 0
+);
 
-int version = 1;
-for (IMendixObject o : Core.retrieveXPathQuery(ctx, "//TripPlanning.VendorSlotPlan")) {
-    Integer v = VendorSlotPlan.initialize(ctx, o).getPlanVersion();
-    if (v != null && v >= version) version = v + 1;
-}
-
-runLog(ctx, version, "run", "Read " + rowsRead + " gate-entry rows since " + from
-    + (wd.isEmpty() ? "" : " (" + wd + " only)") + " -> " + trips.size() + " trips, "
-    + (trips.size() - kept.size()) + " dropped for arriving more than "
-    + Settings.getEarlyCapH() + "h before / " + Settings.getLateCapH() + "h after the slot; "
-    + allDays + " days, " + std.size() + " item standards loaded.");
-
-// 2. Per vendor + slot
-Map<String, List<Trip>> groups = kept.stream().collect(Collectors.groupingBy(t -> t.vendor + "|" + t.slot));
-long written = 0;
-for (Map.Entry<String, List<Trip>> e : groups.entrySet()) {
-    String vendor = e.getKey().split("\\|")[0];
-    String slot = e.getKey().split("\\|")[1];
-    List<Trip> g = e.getValue();
-    long runDays = g.stream().map(t -> t.date).distinct().count();
-    int runsPct = (int) Math.round(100.0 * runDays / Math.max(allDays, 1));
-    if (runsPct < Settings.getMinRunPct()) {
-        runLog(ctx, version, vendor + " | " + slot + " | " + (wd.isEmpty() ? "All" : wd),
-            "Not planned: runs on " + runsPct + "% of days, below the " + Settings.getMinRunPct() + "% minimum.");
-        continue;
-    }
-
-    List<Double> own = g.stream().map(t -> t.offset).sorted().collect(Collectors.toList());
-    boolean useOwn = own.size() >= Settings.getMinTrucks();
-    List<Double> src = useOwn ? own : bySlot.get(slot).stream().sorted().collect(Collectors.toList());
-    double a = pct(src, Settings.getQStart().doubleValue());
-    double b = pct(src, Settings.getQStop().doubleValue());
-    int round = Settings.getRoundMin();
-    int safe = (int) (Math.ceil(a / round) * round);
-    int hard = (int) (Math.ceil((b + Settings.getGraceMin()) / round) * round);
-
-    VendorSlotPlan p = new VendorSlotPlan(ctx);
-    p.setVendor(vendor);
-    p.setSlot(slot);
-    p.setDayOfWeek(wd.isEmpty() ? "All" : wd);
-    p.setSafeStartOffset(safe);
-    p.setHardStopOffset(hard);
-    p.setSafeStart(clock(slot, safe));
-    p.setHardStop(clock(slot, hard));
-    p.setBasis(useOwn ? "Vendor history" : "Slot default (few trucks)");
-    p.setTrucksInHistory(own.size());
-    p.setRunsPct(runsPct);
-    p.setPlanVersion(version);
-    p.setGeneratedOn(new Date());
-    p.setIsActive(true);
-    p.commit();
-    written++;
-    runLog(ctx, version, vendor + " | " + slot + " | " + (wd.isEmpty() ? "All" : wd),
-        (useOwn ? "Own history, " : "Slot default (only ") + own.size() + (useOwn ? " trucks" : " own trucks)")
-        + ", runs on " + runsPct + "% of days. P" + Math.round(Settings.getQStart().doubleValue() * 100)
-        + " = " + Math.round(a) + " min -> safe start " + safe + " min after slot; P"
-        + Math.round(Settings.getQStop().doubleValue() * 100) + " = " + Math.round(b)
-        + " min + " + Settings.getGraceMin() + " grace -> hard stop " + hard + " min after slot.");
-
-    // 3. Bay list: >= 10% of trips, top 5; critical bays first, then share
-    Map<String, Long> visits = new HashMap<>();
-    Set<String> critBay = new LinkedHashSet<>();
-    for (Trip t : g) {
-        for (String bay : t.bays) {
-            visits.merge(bay, 1L, Long::sum);
-            for (String it : t.qty.getOrDefault(bay, new HashMap<>()).keySet()) {
-                ItemStandard is = std.get(it);
-                if (is != null && Boolean.TRUE.equals(is.getIsCritical())) critBay.add(bay);
-            }
-        }
-    }
-    final int n = g.size();
-    List<Map.Entry<String, Long>> bays = visits.entrySet().stream()
-        .filter(x -> 100.0 * x.getValue() / n >= 10)
-        .sorted(Comparator.<Map.Entry<String, Long>>comparingInt(x -> critBay.contains(x.getKey()) ? 0 : 1)
-                .thenComparing(x -> -x.getValue()))
-        .limit(5).collect(Collectors.toList());
-
-    int seq = 0;
-    for (Map.Entry<String, Long> bv : bays) {
-        String bay = bv.getKey();
-        // 4. Stop minutes: P75 of past days of standard minutes + allowance + fixed
-        List<Double> dayMins = new ArrayList<>();
-        double qStd = 0, qAll = 0;
-        for (Trip t : g) {
-            Map<String, Double> items = t.qty.get(bay);
-            if (items == null) continue;
-            double m = 0;
-            for (Map.Entry<String, Double> it : items.entrySet()) {
-                double q = it.getValue();
-                qAll += q;
-                ItemStandard is = std.get(it.getKey());
-                if (is == null || is.getStdMinutes() == null) continue;
-                double tm = is.getStdMinutes().doubleValue();
-                double ps = is.getPackSize() == null ? 0 : is.getPackSize().doubleValue();
-                String basis = is.getBasis() == null ? "per pack" : is.getBasis();
-                if (basis.equals("per piece")) m += q * tm;
-                else if (basis.equals("per stop")) m += q > 0 ? tm : 0;
-                else if (ps > 0) m += Math.ceil(q / ps) * tm;
-                else continue;
-                qStd += q;
-            }
-            dayMins.add(m);
-        }
-        int mins;
-        String mb;
-        if (qAll > 0 && qStd / qAll >= 0.5 && !dayMins.isEmpty()) {
-            double raw = pct(dayMins.stream().sorted().collect(Collectors.toList()),
-                             Settings.getQStopMinutes().doubleValue());
-            mins = (int) (Math.ceil((raw * (1 + Settings.getAllowancePct() / 100.0) + Settings.getFixedMin()) / 5) * 5);
-            mb = "Your standard";
-        } else {
-            mins = Settings.getManualMin();
-            mb = "Manual (no standard)";
-        }
-        PlanStop ps = new PlanStop(ctx);
-        ps.setSequence(++seq);
-        ps.setBayCode(bay);
-        ps.setStopMinutes(mins);
-        ps.setMinutesBasis(mb);
-        ps.setIsCritical(critBay.contains(bay));
-        ps.setSharePct((int) Math.round(100.0 * bv.getValue() / n));
-        ps.setPlanStop_VendorSlotPlan(p);
-        List<IMendixObject> bo = Core.retrieveXPathQuery(ctx,
-            "//TripPlanning.Bay[Code = '" + bay.replace("'", "''") + "']");
-        if (!bo.isEmpty()) ps.setPlanStop_Bay(tripplanning.proxies.Bay.initialize(ctx, bo.get(0)));
-        ps.commit();
-    }
-}
-return written;
-$$
-extra code $$
-private static void runLog(com.mendix.systemwideinterfaces.core.IContext ctx, int version,
-        String scope, String msg) throws Exception {
-    tripplanning.proxies.PlanRunLog l = new tripplanning.proxies.PlanRunLog(ctx);
-    l.setRunAt(new java.util.Date());
-    l.setPlanVersion(version);
-    l.setScope(scope.length() > 80 ? scope.substring(0, 80) : scope);
-    l.setMessage(msg.length() > 500 ? msg.substring(0, 500) : msg);
-    l.commit();
-}
-
-private static final class Trip {
-    String vendor, slot;
-    java.time.LocalDate date;
-    double offset;
-    java.util.Set<String> bays = new java.util.LinkedHashSet<>();
-    java.util.Map<String, java.util.Map<String, Double>> qty = new java.util.HashMap<>();
-}
-
-/** Linear-interpolated percentile of a sorted list (pandas default). */
-private static double pct(java.util.List<Double> sorted, double q) {
-    if (sorted.isEmpty()) return 0;
-    double pos = q * (sorted.size() - 1);
-    int lo = (int) Math.floor(pos), hi = (int) Math.ceil(pos);
-    return sorted.get(lo) + (sorted.get(hi) - sorted.get(lo)) * (pos - lo);
-}
-
-/** Slot hh:mm plus offset minutes as clock text; (+1d)/(-1d) when it rolls over. */
-private static String clock(String slot, int offset) {
-    int h = Integer.parseInt(slot.substring(0, 2)), m = Integer.parseInt(slot.substring(3, 5));
-    int t = h * 60 + m + offset;
-    int day = Math.floorDiv(t, 1440);
-    t = Math.floorMod(t, 1440);
-    String s = String.format("%02d:%02d", t / 60, t % 60);
-    return day == 0 ? s : s + " (" + (day > 0 ? "+" : "") + day + "d)";
-}
-$$;
+/** How often a vendor + slot uses a bay */
+@position(1300, 700)
+create persistent entity TripPlanning.BayShare (
+  Vendor: string(20),
+  Slot: string(5),
+  Bay: string(20),
+  Visits: integer default 0,
+  QtyAll: decimal default 0,
+  QtyStd: decimal default 0,
+  HasCritical: boolean default false
+);
 
 -- MARK: MICROFLOWS -----------------------------------------------------------
 
@@ -395,11 +206,497 @@ begin
   return $Settings;
 end;
 
-/** Retire the active plan and generate a new version (all days + each weekday). */
+/** One line of explanation, shown on the Why-this-plan page */
+create microflow TripPlanning.SUB_RunLog (
+  $Version: integer,
+  $Scope: string,
+  $Message: string
+)
+folder 'Plan'
+begin
+  $L = create TripPlanning.PlanRunLog (
+    RunAt = [%CurrentDateTime%],
+    PlanVersion = $Version,
+    Scope = $Scope,
+    Message = $Message
+  );
+  commit $L;
+  return;
+end;
+
+/** Slot hh:mm + offset minutes as clock text, e.g. 09:15 or 00:10 (+1d) */
+create microflow TripPlanning.SUB_ClockText (
+  $Slot: string,
+  $Offset: integer
+)
+returns string as $Text
+folder 'Plan'
+begin
+  declare $Total integer = parseInteger(substring($Slot, 0, 2)) * 60 + parseInteger(substring($Slot, 3, 2)) + $Offset;
+  declare $Day integer = floor($Total / 1440);
+  declare $Rest integer = $Total - $Day * 1440;
+  declare $Hh integer = floor($Rest / 60);
+  declare $Mm integer = $Rest - $Hh * 60;
+  declare $HhText string = toString($Hh);
+  declare $MmText string = toString($Mm);
+  if $Hh < 10 then
+    set $HhText = '0' + $HhText;
+  end if;
+  if $Mm < 10 then
+    set $MmText = '0' + $MmText;
+  end if;
+  declare $Out string = $HhText + ':' + $MmText;
+  if $Day > 0 then
+    set $Out = $Out + ' (+' + toString($Day) + 'd)';
+  end if;
+  if $Day < 0 then
+    set $Out = $Out + ' (' + toString($Day) + 'd)';
+  end if;
+  return $Out;
+end;
+
+/** The q-th percentile (0..1) of OffsetMin, read from the database in sorted order:
+ *  no list is loaded, only the two neighbouring rows. */
+create microflow TripPlanning.SUB_PercentileTrip (
+  $Vendor: string,
+  $Slot: string,
+  $UseVendor: boolean,
+  $N: integer,
+  $Q: decimal
+)
+returns decimal as $Value
+folder 'Plan'
+begin
+  declare $Pos decimal = $Q * ($N - 1);
+  declare $Lo integer = floor($Pos);
+  declare $Hi integer = ceil($Pos);
+  declare $A decimal = 0;
+  declare $B decimal = 0;
+  if $UseVendor then
+    retrieve $LoRows from TripPlanning.HistTrip
+      where [Vendor = $Vendor and Slot = $Slot]
+      sort by OffsetMin asc
+      limit 1 offset $Lo;
+    retrieve $HiRows from TripPlanning.HistTrip
+      where [Vendor = $Vendor and Slot = $Slot]
+      sort by OffsetMin asc
+      limit 1 offset $Hi;
+    declare $LoObj TripPlanning.HistTrip = head($LoRows);
+    declare $HiObj TripPlanning.HistTrip = head($HiRows);
+    set $A = $LoObj/OffsetMin;
+    set $B = $HiObj/OffsetMin;
+  else
+    retrieve $LoAll from TripPlanning.HistTrip
+      where [Slot = $Slot]
+      sort by OffsetMin asc
+      limit 1 offset $Lo;
+    retrieve $HiAll from TripPlanning.HistTrip
+      where [Slot = $Slot]
+      sort by OffsetMin asc
+      limit 1 offset $Hi;
+    declare $LoAllObj TripPlanning.HistTrip = head($LoAll);
+    declare $HiAllObj TripPlanning.HistTrip = head($HiAll);
+    set $A = $LoAllObj/OffsetMin;
+    set $B = $HiAllObj/OffsetMin;
+  end if;
+  return $A + ($B - $A) * ($Pos - $Lo);
+end;
+
+/** Same, for the standard unloading minutes of one vendor + slot + bay */
+create microflow TripPlanning.SUB_PercentileStop (
+  $Vendor: string,
+  $Slot: string,
+  $Bay: string,
+  $N: integer,
+  $Q: decimal
+)
+returns decimal as $Value
+folder 'Plan'
+begin
+  declare $Pos decimal = $Q * ($N - 1);
+  declare $Lo integer = floor($Pos);
+  declare $Hi integer = ceil($Pos);
+  retrieve $LoRows from TripPlanning.HistStop
+    where [Vendor = $Vendor and Slot = $Slot and Bay = $Bay]
+    sort by StdMin asc
+    limit 1 offset $Lo;
+  retrieve $HiRows from TripPlanning.HistStop
+    where [Vendor = $Vendor and Slot = $Slot and Bay = $Bay]
+    sort by StdMin asc
+    limit 1 offset $Hi;
+  declare $LoObj TripPlanning.HistStop = head($LoRows);
+  declare $HiObj TripPlanning.HistStop = head($HiRows);
+  return $LoObj/StdMin + ($HiObj/StdMin - $LoObj/StdMin) * ($Pos - $Lo);
+end;
+
+/** Step 1: turn GateEntry rows into trips (truck + entry time) and bay stops.
+ *  Rows are read 5000 at a time, sorted by truck, entry time, bay. Returns trips kept. */
+create microflow TripPlanning.SUB_BuildHistory (
+  $Settings: TripPlanning.PlanSettings,
+  $Version: integer
+)
+returns integer as $Kept
+folder 'Plan'
+begin
+  retrieve $OldTrips from TripPlanning.HistTrip;
+  delete $OldTrips;
+  retrieve $OldStops from TripPlanning.HistStop;
+  delete $OldStops;
+  retrieve $Standards from TripPlanning.ItemStandard;
+
+  declare $From datetime = addDays([%CurrentDateTime%], -7 * $Settings/HistoryWeeks);
+  declare $EarlyMin integer = -60 * $Settings/EarlyCapH;
+  declare $LateMin integer = 60 * $Settings/LateCapH;
+  declare $Skip integer = 0;
+  declare $More boolean = true;
+  declare $LastTrip string = '';
+  declare $LastStop string = '';
+  declare $Read integer = 0;
+  declare $Kept integer = 0;
+  declare $Dropped integer = 0;
+  declare $Trip TripPlanning.HistTrip = empty;
+  declare $Stop TripPlanning.HistStop = empty;
+  declare $Key string = '';
+  declare $SlotMin integer = 0;
+  declare $Off integer = 0;
+  declare $RowMin decimal = 0;
+  declare $RowStd decimal = 0;
+  declare $Qty decimal = 0;
+  declare $IsCrit boolean = false;
+
+  while $More begin
+    retrieve $Batch from TripPlanning.GateEntry
+      where [SupplyDate >= $From and GateIn != empty]
+      sort by TruckId asc, GateIn asc, Bay asc
+      limit 5000 offset $Skip;
+    if length($Batch) = 0 then
+      set $More = false;
+    else
+      set $Skip = $Skip + 5000;
+      loop $Row in $Batch begin
+        set $Read = $Read + 1;
+        set $Key = $Row/TruckId + '@' + toString($Row/GateIn);
+        if $Key != $LastTrip then
+          set $LastTrip = $Key;
+          set $LastStop = '';
+          if $Stop != empty then
+            commit $Stop;
+            set $Stop = empty;
+          end if;
+          set $SlotMin = parseInteger(substring($Row/Slot, 0, 2)) * 60 + parseInteger(substring($Row/Slot, 3, 2));
+          set $Off = minutesBetween(addMinutes(trimToDays($Row/SupplyDate), $SlotMin), $Row/GateIn);
+          if $Off >= $EarlyMin and $Off <= $LateMin then
+            $NewTrip = create TripPlanning.HistTrip (
+              Vendor = $Row/Vendor,
+              Slot = $Row/Slot,
+              SupplyDate = $Row/SupplyDate,
+              TruckId = $Row/TruckId,
+              GateIn = $Row/GateIn,
+              OffsetMin = $Off
+            );
+            commit $NewTrip;
+            set $Trip = $NewTrip;
+            set $Kept = $Kept + 1;
+          else
+            set $Trip = empty;
+            set $Dropped = $Dropped + 1;
+          end if;
+        end if;
+
+        if $Trip != empty and $Row/Bay != empty then
+          if $Row/Bay != $LastStop then
+            if $Stop != empty then
+              commit $Stop;
+            end if;
+            set $LastStop = $Row/Bay;
+            $NewStop = create TripPlanning.HistStop (
+              Vendor = $Row/Vendor,
+              Slot = $Row/Slot,
+              Bay = $Row/Bay
+            );
+            set $Stop = $NewStop;
+          end if;
+          -- standard unloading minutes of this row
+          set $Qty = 0;
+          if $Row/ReceivedQty != empty then
+            set $Qty = $Row/ReceivedQty;
+          end if;
+          set $RowMin = 0;
+          set $RowStd = 0;
+          set $IsCrit = false;
+          retrieve $Found from $Standards where Item = $Row/Item limit 1;
+          declare $Match TripPlanning.ItemStandard = head($Found);
+          if $Match != empty then
+            if $Match/IsCritical = true then
+              set $IsCrit = true;
+            end if;
+            if $Match/StdMinutes != empty then
+              if $Match/Basis = 'per piece' then
+                set $RowMin = $Qty * $Match/StdMinutes;
+                set $RowStd = $Qty;
+              elsif $Match/Basis = 'per stop' then
+                if $Qty > 0 then
+                  set $RowMin = $Match/StdMinutes;
+                  set $RowStd = $Qty;
+                end if;
+              elsif $Match/PackSize != empty and $Match/PackSize > 0 then
+                set $RowMin = ceil($Qty / $Match/PackSize) * $Match/StdMinutes;
+                set $RowStd = $Qty;
+              end if;
+            end if;
+          end if;
+          change $Stop (
+            StdMin = $Stop/StdMin + $RowMin,
+            QtyAll = $Stop/QtyAll + $Qty,
+            QtyStd = $Stop/QtyStd + $RowStd,
+            HasCritical = $Stop/HasCritical or $IsCrit
+          );
+        end if;
+      end loop;
+    end if;
+  end while;
+  if $Stop != empty then
+    commit $Stop;
+  end if;
+
+  call microflow TripPlanning.SUB_RunLog (
+    Version = $Version,
+    Scope = 'run',
+    Message = 'Read ' + toString($Read) + ' gate-entry rows since ' + formatDateTime($From, 'yyyy-MM-dd')
+      + ': ' + toString($Kept) + ' trips kept, ' + toString($Dropped)
+      + ' dropped for arriving more than ' + toString($Settings/EarlyCapH) + 'h before or '
+      + toString($Settings/LateCapH) + 'h after the slot; '
+      + toString(length($Standards)) + ' item standards loaded.'
+  );
+  return $Kept;
+end;
+
+/** Step 2: trips per vendor + slot, per slot, bay usage, and days with any trucks.
+ *  Returns the number of distinct days. */
+create microflow TripPlanning.SUB_BuildGroups ()
+returns integer as $AllDays
+folder 'Plan'
+begin
+  retrieve $OldG from TripPlanning.VsGroup;
+  delete $OldG;
+  retrieve $OldS from TripPlanning.SlotGroup;
+  delete $OldS;
+  retrieve $OldB from TripPlanning.BayShare;
+  delete $OldB;
+
+  -- vendor + slot groups
+  retrieve $Trips from TripPlanning.HistTrip sort by Vendor asc, Slot asc, SupplyDate asc;
+  declare $G TripPlanning.VsGroup = empty;
+  declare $LastV string = '';
+  declare $LastS string = '';
+  declare $LastD datetime = empty;
+  loop $T in $Trips begin
+    if $T/Vendor != $LastV or $T/Slot != $LastS then
+      if $G != empty then
+        commit $G;
+      end if;
+      $NewG = create TripPlanning.VsGroup (Vendor = $T/Vendor, Slot = $T/Slot, N = 0, RunDays = 0);
+      set $G = $NewG;
+      set $LastV = $T/Vendor;
+      set $LastS = $T/Slot;
+      set $LastD = empty;
+    end if;
+    change $G (N = $G/N + 1);
+    if $LastD = empty or $T/SupplyDate != $LastD then
+      change $G (RunDays = $G/RunDays + 1);
+      set $LastD = $T/SupplyDate;
+    end if;
+  end loop;
+  if $G != empty then
+    commit $G;
+  end if;
+
+  -- slot groups: sum of the vendor groups
+  retrieve $Groups from TripPlanning.VsGroup sort by Slot asc;
+  declare $SG TripPlanning.SlotGroup = empty;
+  set $LastS = '';
+  loop $Gp in $Groups begin
+    if $Gp/Slot != $LastS then
+      if $SG != empty then
+        commit $SG;
+      end if;
+      $NewSG = create TripPlanning.SlotGroup (Slot = $Gp/Slot, N = 0);
+      set $SG = $NewSG;
+      set $LastS = $Gp/Slot;
+    end if;
+    change $SG (N = $SG/N + $Gp/N);
+  end loop;
+  if $SG != empty then
+    commit $SG;
+  end if;
+
+  -- distinct days with any trip
+  retrieve $ByDay from TripPlanning.HistTrip sort by SupplyDate asc;
+  declare $Days integer = 0;
+  set $LastD = empty;
+  loop $D in $ByDay begin
+    if $LastD = empty or $D/SupplyDate != $LastD then
+      set $Days = $Days + 1;
+      set $LastD = $D/SupplyDate;
+    end if;
+  end loop;
+
+  -- bay usage per vendor + slot + bay
+  retrieve $Stops from TripPlanning.HistStop sort by Vendor asc, Slot asc, Bay asc;
+  declare $BS TripPlanning.BayShare = empty;
+  declare $LastB string = '';
+  set $LastV = '';
+  set $LastS = '';
+  loop $St in $Stops begin
+    if $St/Vendor != $LastV or $St/Slot != $LastS or $St/Bay != $LastB then
+      if $BS != empty then
+        commit $BS;
+      end if;
+      $NewBS = create TripPlanning.BayShare (Vendor = $St/Vendor, Slot = $St/Slot, Bay = $St/Bay);
+      set $BS = $NewBS;
+      set $LastV = $St/Vendor;
+      set $LastS = $St/Slot;
+      set $LastB = $St/Bay;
+    end if;
+    change $BS (
+      Visits = $BS/Visits + 1,
+      QtyAll = $BS/QtyAll + $St/QtyAll,
+      QtyStd = $BS/QtyStd + $St/QtyStd,
+      HasCritical = $BS/HasCritical or $St/HasCritical
+    );
+  end loop;
+  if $BS != empty then
+    commit $BS;
+  end if;
+  return $Days;
+end;
+
+/** Step 3: one VendorSlotPlan per vendor + slot, with its ordered PlanStops,
+ *  and a PlanRunLog line explaining every decision. */
+create microflow TripPlanning.SUB_WritePlans (
+  $Settings: TripPlanning.PlanSettings,
+  $Version: integer,
+  $AllDays: integer
+)
+returns integer as $Written
+folder 'Plan'
+begin
+  retrieve $Groups from TripPlanning.VsGroup sort by Vendor asc, Slot asc;
+  declare $Written integer = 0;
+  declare $Runs integer = 0;
+  declare $Own boolean = false;
+  declare $Np integer = 0;
+  declare $Safe integer = 0;
+  declare $Hard integer = 0;
+  declare $Seq integer = 0;
+  declare $Mins integer = 0;
+  declare $MinsBasis string = '';
+  declare $Scope string = '';
+  declare $BasisText string = '';
+
+  loop $Gp in $Groups begin
+    set $Scope = $Gp/Vendor + ' | ' + $Gp/Slot;
+    set $Runs = round(100.0 * $Gp/RunDays / $AllDays);
+    if $Runs < $Settings/MinRunPct then
+      call microflow TripPlanning.SUB_RunLog (
+        Version = $Version, Scope = $Scope,
+        Message = 'Not planned: runs on ' + toString($Runs) + '% of days, below the '
+          + toString($Settings/MinRunPct) + '% minimum.'
+      );
+    else
+      set $Own = $Gp/N >= $Settings/MinTrucks;
+      set $Np = $Gp/N;
+      set $BasisText = 'Vendor history';
+      if $Own = false then
+        retrieve $SlotRow from TripPlanning.SlotGroup where [Slot = $Gp/Slot] first;
+        set $Np = $SlotRow/N;
+        set $BasisText = 'Slot default (few trucks)';
+      end if;
+      $A = call microflow TripPlanning.SUB_PercentileTrip (
+        Vendor = $Gp/Vendor, Slot = $Gp/Slot, UseVendor = $Own, N = $Np, Q = $Settings/QStart);
+      $B = call microflow TripPlanning.SUB_PercentileTrip (
+        Vendor = $Gp/Vendor, Slot = $Gp/Slot, UseVendor = $Own, N = $Np, Q = $Settings/QStop);
+      set $Safe = ceil($A / $Settings/RoundMin) * $Settings/RoundMin;
+      set $Hard = ceil(($B + $Settings/GraceMin) / $Settings/RoundMin) * $Settings/RoundMin;
+
+      $SafeText = call microflow TripPlanning.SUB_ClockText (Slot = $Gp/Slot, Offset = $Safe);
+      $HardText = call microflow TripPlanning.SUB_ClockText (Slot = $Gp/Slot, Offset = $Hard);
+      $Plan = create TripPlanning.VendorSlotPlan (
+        Vendor = $Gp/Vendor,
+        Slot = $Gp/Slot,
+        DayOfWeek = 'All',
+        SafeStartOffset = $Safe,
+        HardStopOffset = $Hard,
+        SafeStart = $SafeText,
+        HardStop = $HardText,
+        Basis = $BasisText,
+        TrucksInHistory = $Gp/N,
+        RunsPct = $Runs,
+        PlanVersion = $Version,
+        GeneratedOn = [%CurrentDateTime%],
+        IsActive = true
+      );
+      commit $Plan;
+      set $Written = $Written + 1;
+      call microflow TripPlanning.SUB_RunLog (
+        Version = $Version, Scope = $Scope,
+        Message = $BasisText + ', ' + toString($Gp/N) + ' own trucks, runs on ' + toString($Runs)
+          + '% of days. P' + toString(round(100 * $Settings/QStart)) + ' = ' + toString(round($A))
+          + ' min -> safe start ' + $SafeText + '; P' + toString(round(100 * $Settings/QStop))
+          + ' = ' + toString(round($B)) + ' min + ' + toString($Settings/GraceMin)
+          + ' grace -> hard stop ' + $HardText + '.'
+      );
+
+      -- bays: used on at least 10% of trips, top 5, critical first
+      retrieve $Shares from TripPlanning.BayShare
+        where [Vendor = $Gp/Vendor and Slot = $Gp/Slot]
+        sort by HasCritical desc, Visits desc;
+      set $Seq = 0;
+      loop $Sh in $Shares begin
+        if $Seq < 5 and 100.0 * $Sh/Visits / $Gp/N >= 10 then
+          set $Seq = $Seq + 1;
+          if $Sh/QtyAll > 0 and $Sh/QtyStd / $Sh/QtyAll >= 0.5 then
+            $Raw = call microflow TripPlanning.SUB_PercentileStop (
+              Vendor = $Gp/Vendor, Slot = $Gp/Slot, Bay = $Sh/Bay, N = $Sh/Visits, Q = $Settings/QStopMinutes);
+            set $Mins = ceil(($Raw * (1 + $Settings/AllowancePct / 100.0) + $Settings/FixedMin) / 5) * 5;
+            set $MinsBasis = 'Your standard';
+          else
+            set $Mins = $Settings/ManualMin;
+            set $MinsBasis = 'Manual (no standard)';
+          end if;
+          $Stop = create TripPlanning.PlanStop (
+            Sequence = $Seq,
+            BayCode = $Sh/Bay,
+            StopMinutes = $Mins,
+            MinutesBasis = $MinsBasis,
+            IsCritical = $Sh/HasCritical,
+            SharePct = round(100.0 * $Sh/Visits / $Gp/N)
+          );
+          change $Stop (PlanStop_VendorSlotPlan = $Plan);
+          retrieve $BayObj from TripPlanning.Bay where [Code = $Sh/Bay] first;
+          if $BayObj != empty then
+            change $Stop (PlanStop_Bay = $BayObj);
+          end if;
+          commit $Stop;
+        end if;
+      end loop;
+    end if;
+  end loop;
+  return $Written;
+end;
+
+/** Retire the active plan, then rebuild: history -> groups -> plan rows. */
 create microflow TripPlanning.SE_GeneratePlan ()
 folder 'Plan'
 begin
   $Cfg = call microflow TripPlanning.SUB_GetSettings ();
+
+  retrieve $Last from TripPlanning.VendorSlotPlan sort by PlanVersion desc limit 1;
+  declare $LastPlan TripPlanning.VendorSlotPlan = head($Last);
+  declare $Version integer = 1;
+  if $LastPlan != empty then
+    set $Version = $LastPlan/PlanVersion + 1;
+  end if;
 
   retrieve $Active from TripPlanning.VendorSlotPlan where [IsActive = true];
   loop $Old in $Active begin
@@ -407,17 +704,14 @@ begin
   end loop;
   commit $Active;
 
-  $Rows = call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = '');
-  log info node 'TripPlanning' 'Plan rows written (all days): {1}' with ({1} = toString($Rows));
-
-  -- One plan per weekday too, used when the yard plans a specific day
-  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'MONDAY');
-  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'TUESDAY');
-  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'WEDNESDAY');
-  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'THURSDAY');
-  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'FRIDAY');
-  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'SATURDAY');
-  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'SUNDAY');
+  $Kept = call microflow TripPlanning.SUB_BuildHistory (Settings = $Cfg, Version = $Version);
+  $AllDays = call microflow TripPlanning.SUB_BuildGroups ();
+  if $AllDays > 0 then
+    $Written = call microflow TripPlanning.SUB_WritePlans (Settings = $Cfg, Version = $Version, AllDays = $AllDays);
+    log info node 'TripPlanning' 'Plan version {1}: {2} plan rows' with ({1} = toString($Version), {2} = toString($Written));
+  else
+    call microflow TripPlanning.SUB_RunLog (Version = $Version, Scope = 'run', Message = 'No usable trips: nothing planned.');
+  end if;
   return;
 end;
 

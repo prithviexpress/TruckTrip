@@ -55,16 +55,20 @@ tab): one row per bay-fallback pair, `Rank` = position in the list.
 Still to wire in Studio Pro: the two integrations (truck-entry alert -> `OnGateEntry`,
 occupancy feed -> `Bay.Occupied` and `OnBayFree`) and a yard page on Trip/Allocation.
 
-## What runs
-- `SE_GeneratePlan`: retires the active plan, runs `GeneratePlan` for all days and
-  once per weekday. Scheduled weekly (Sunday 22:00, disabled until you enable it);
-  `ACT_GeneratePlanNow` wraps it for a button.
-- `GeneratePlan` (Java): trips = truck + gate-entry time; drops entries more than
-  EarlyCapH/LateCapH hours from the slot; safe start = P(QStart) rounded up, hard stop
-  = P(QStop) + grace rounded up; slot-wide fallback under MinTrucks; bay list = bays on
-  >= 10% of trips, top 5, critical first; stop minutes = P(QStopMinutes) of daily
-  standard minutes x (1 + allowance) + fixed, rounded up to 5, else ManualMin.
-  Same percentile math as the Python (linear interpolation).
+## What runs (microflows only; one tiny Java helper)
+`SE_GeneratePlan` (weekly scheduled event, disabled until enabled; button via `ACT_GeneratePlanNow`):
+1. `SUB_BuildHistory`: reads `GateEntry` 5000 rows at a time, sorted by truck, entry time and bay;
+   a trip = truck + entry time; drops entries more than EarlyCapH/LateCapH hours from the slot;
+   writes `HistTrip` (minutes vs slot) and `HistStop` (standard unloading minutes per bay).
+2. `SUB_BuildGroups`: trips and run-days per vendor + slot, trips per slot, bay usage (`BayShare`).
+3. `SUB_WritePlans`: per vendor + slot: safe start = P(QStart) rounded up, hard stop = P(QStop)
+   + grace rounded up (slot-wide percentile when under MinTrucks); bays used on >= 10% of
+   trips, top 5, critical first; stop minutes = P(QStopMinutes) of standard minutes x
+   (1 + allowance) + fixed, rounded up to 5, else ManualMin. Every decision is a `PlanRunLog` line.
+Percentiles come from `SUB_PercentileTrip` / `SUB_PercentileStop`: the database returns the two
+neighbouring rows in sorted order, so no big list is held in memory. The only Java is
+`MinutesFromSlot` in the live script (a few lines of date arithmetic).
+Not yet in the Mendix version: per-weekday plans (the plan is for all days).
 
 ## Data loads
 - `GateEntry`: the parquet rows (Excel/CSV import or REST).
