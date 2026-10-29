@@ -72,7 +72,11 @@ create persistent entity TripPlanning.ItemStandard (
 @position(1000, 100)
 create persistent entity TripPlanning.Bay (
   Code: string(20) not null unique,
-  IsHotLane: boolean default false
+  IsHotLane: boolean default false,
+  /** Set by the bay occupancy feed */
+  Occupied: boolean default false,
+  /** Held for a truck sent here, until its expected end plus the gap */
+  ReservedUntil: datetime
 );
 
 -- MARK: OUTPUTS --------------------------------------------------------------

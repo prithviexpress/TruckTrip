@@ -1,0 +1,353 @@
+mdl 1;
+-- =============================================================================
+-- TripPlanning live allocation: one decision per gate entry, at the gate.
+-- Run AFTER tripplanning.mdl (it extends Bay and reads VendorSlotPlan / PlanStop).
+--
+--   mxcli check mendix/tripplanning_live.mdl
+--   mxcli -p App.mpr -c "execute script 'mendix/tripplanning_live.mdl'"
+--
+-- Rules (same as trip_demand_analysis.py, Bay schedule tab):
+--   * before safe start: truck waits in the yard
+--   * after hard stop:   slot withdrawn
+--   * else: planned bay if free, else nearest free fallback bay (never a hot-lane
+--     bay), else the truck is Hot and goes to a free hot-lane bay
+--   * only the arriving truck moves; trucks already at a bay are never bumped
+--     (no swap chains)
+-- =============================================================================
+
+create enumeration TripPlanning.TripStatus (
+  Waiting 'Waiting',
+  AtBay 'At bay',
+  Done 'Done',
+  Withdrawn 'Withdrawn',
+  Hot 'Hot'
+);
+
+-- MARK: ENTITIES -------------------------------------------------------------
+
+/** Fallback bays for a bay, nearest first (from fallback_map.csv) */
+create persistent entity TripPlanning.BayFallback (
+  Rank: integer not null default 1
+);
+
+/** One gate entry being handled today */
+create persistent entity TripPlanning.Trip (
+  TruckId: string(30) not null,
+  Vendor: string(20) not null,
+  Slot: string(5) not null,
+  GateIn: datetime not null,
+  Status: enumeration(TripPlanning.TripStatus) default TripPlanning.TripStatus.Waiting,
+  /** Sequence of the next PlanStop to serve */
+  NextSeq: integer default 1
+)
+index (Status);
+
+/** Which truck was sent to which bay, and for how long */
+create persistent entity TripPlanning.Allocation (
+  Start: datetime not null,
+  ExpectedEnd: datetime not null,
+  ActualEnd: datetime,
+  Swapped: boolean default false,
+  Reason: string(100),
+  OverrunLogged: boolean default false
+);
+
+create persistent entity TripPlanning.ExceptionLog (
+  Type: string(30),
+  Reason: string(200),
+  LoggedAt: datetime,
+  Who: string(50)
+);
+
+create association TripPlanning.BayFallback_Bay
+  from TripPlanning.BayFallback to TripPlanning.Bay type reference;
+create association TripPlanning.BayFallback_FallbackBay
+  from TripPlanning.BayFallback to TripPlanning.Bay type reference;
+create association TripPlanning.Trip_VendorSlotPlan
+  from TripPlanning.Trip to TripPlanning.VendorSlotPlan type reference;
+create association TripPlanning.Allocation_Trip
+  from TripPlanning.Allocation to TripPlanning.Trip type reference;
+create association TripPlanning.Allocation_PlanStop
+  from TripPlanning.Allocation to TripPlanning.PlanStop type reference;
+create association TripPlanning.Allocation_Bay
+  from TripPlanning.Allocation to TripPlanning.Bay type reference;
+create association TripPlanning.ExceptionLog_Trip
+  from TripPlanning.ExceptionLog to TripPlanning.Trip type reference;
+
+-- MARK: JAVA -----------------------------------------------------------------
+
+/** Minutes from the slot time to At. A truck just after midnight for a late
+ *  slot is measured against yesterday's slot when that is closer. */
+create java action TripPlanning.MinutesFromSlot (
+  Slot: string not null,
+  At: datetime not null
+) returns long
+as $$
+java.time.ZoneId z = java.time.ZoneId.systemDefault();
+java.time.LocalDateTime in = java.time.LocalDateTime.ofInstant(At.toInstant(), z);
+java.time.LocalDateTime slot = in.toLocalDate().atTime(java.time.LocalTime.parse(Slot));
+long d = java.time.Duration.between(slot, in).toMinutes();
+long prev = java.time.Duration.between(slot.minusDays(1), in).toMinutes();
+return Math.abs(prev) < Math.abs(d) ? prev : d;
+$$;
+
+-- MARK: SUB-FLOWS ------------------------------------------------------------
+
+create microflow TripPlanning.SUB_Log (
+  $Trip: TripPlanning.Trip,
+  $Type: string,
+  $Reason: string
+)
+folder 'Live'
+begin
+  $L = create TripPlanning.ExceptionLog (
+    Type = $Type,
+    Reason = $Reason,
+    LoggedAt = [%CurrentDateTime%]
+  );
+  change $L (ExceptionLog_Trip = $Trip);
+  commit $L;
+  return;
+end;
+
+/** The bay with this code if it is free right now, else empty */
+create microflow TripPlanning.SUB_FreeBay ($Code: string)
+returns TripPlanning.Bay as $Bay
+folder 'Live'
+begin
+  retrieve $Bay from TripPlanning.Bay
+    where [Code = $Code and Occupied = false
+           and (ReservedUntil = empty or ReservedUntil <= [%CurrentDateTime%])]
+    limit 1;
+  return $Bay;
+end;
+
+/** Record the allocation and hold the bay until expected end + gap */
+create microflow TripPlanning.SUB_Allocate (
+  $Trip: TripPlanning.Trip,
+  $Stop: TripPlanning.PlanStop,
+  $Bay: TripPlanning.Bay,
+  $Swapped: boolean,
+  $Reason: string
+)
+folder 'Live'
+begin
+  retrieve $Settings from TripPlanning.PlanSettings limit 1;
+  declare $End datetime = addMinutes([%CurrentDateTime%], $Stop/StopMinutes);
+  $A = create TripPlanning.Allocation (
+    Start = [%CurrentDateTime%],
+    ExpectedEnd = $End,
+    Swapped = $Swapped,
+    Reason = $Reason
+  );
+  change $A (
+    Allocation_Trip = $Trip,
+    Allocation_PlanStop = $Stop,
+    Allocation_Bay = $Bay
+  );
+  commit $A;
+  change $Bay (ReservedUntil = addMinutes($End, $Settings/GapMin));
+  commit $Bay;
+  change $Trip (
+    Status = TripPlanning.TripStatus.AtBay,
+    NextSeq = $Stop/Sequence + 1
+  );
+  commit $Trip;
+  log info node 'TripPlanning' 'Truck {1} -> bay {2} ({3})'
+    with ({1} = $Trip/TruckId, {2} = $Bay/Code, {3} = $Reason);
+  return;
+end;
+
+-- MARK: CORE -----------------------------------------------------------------
+
+/** Send the truck to its next planned bay, or a fallback, or mark it Hot */
+create microflow TripPlanning.AllocateNextStop ($Trip: TripPlanning.Trip)
+folder 'Live'
+begin
+  retrieve $Plan from $Trip/TripPlanning.Trip_VendorSlotPlan;
+  if $Plan = empty then
+    change $Trip (Status = TripPlanning.TripStatus.Hot);
+    commit $Trip;
+    call microflow TripPlanning.SUB_Log (Trip = $Trip, Type = 'Hot', Reason = 'No plan for vendor and slot');
+    return;
+  end if;
+
+  declare $Next integer = $Trip/NextSeq;
+  retrieve $Stop from TripPlanning.PlanStop
+    where [PlanStop_VendorSlotPlan = $Plan and Sequence = $Next]
+    limit 1;
+  if $Stop = empty then
+    change $Trip (Status = TripPlanning.TripStatus.Done);
+    commit $Trip;
+    return;
+  end if;
+
+  -- 1. planned bay
+  declare $Code string = $Stop/BayCode;
+  $Free = call microflow TripPlanning.SUB_FreeBay (Code = $Code);
+  if $Free != empty then
+    call microflow TripPlanning.SUB_Allocate (Trip = $Trip, Stop = $Stop, Bay = $Free, Swapped = false, Reason = 'Planned bay');
+    return;
+  end if;
+
+  -- 2. fallback bays, nearest first; hot-lane bays are not fallbacks
+  retrieve $PlanBay from TripPlanning.Bay where [Code = $Code] limit 1;
+  declare $Done boolean = false;
+  if $PlanBay != empty then
+    retrieve $Fallbacks from TripPlanning.BayFallback
+      where [BayFallback_Bay = $PlanBay]
+      sort by Rank asc;
+    loop $F in $Fallbacks begin
+      retrieve $FBay from $F/TripPlanning.BayFallback_FallbackBay;
+      declare $FCode string = $FBay/Code;
+      $FFree = call microflow TripPlanning.SUB_FreeBay (Code = $FCode);
+      if $FFree != empty then
+        if $FFree/IsHotLane = false then
+          call microflow TripPlanning.SUB_Allocate (Trip = $Trip, Stop = $Stop, Bay = $FFree, Swapped = true, Reason = 'Planned bay busy');
+          set $Done = true;
+          break;
+        end if;
+      end if;
+    end loop;
+  end if;
+  if $Done then
+    return;
+  end if;
+
+  -- 3. no free fallback: Hot, handled on the hot lane
+  change $Trip (Status = TripPlanning.TripStatus.Hot);
+  commit $Trip;
+  retrieve $HotBay from TripPlanning.Bay
+    where [IsHotLane = true and Occupied = false
+           and (ReservedUntil = empty or ReservedUntil <= [%CurrentDateTime%])]
+    limit 1;
+  if $HotBay != empty then
+    call microflow TripPlanning.SUB_Allocate (Trip = $Trip, Stop = $Stop, Bay = $HotBay, Swapped = true, Reason = 'Hot lane');
+  else
+    call microflow TripPlanning.SUB_Log (Trip = $Trip, Type = 'Hot', Reason = 'No free fallback or hot-lane bay');
+  end if;
+  return;
+end;
+
+-- MARK: EVENTS ---------------------------------------------------------------
+
+/** Call from the truck-entry alert */
+create microflow TripPlanning.OnGateEntry (
+  $TruckId: string,
+  $Vendor: string,
+  $Slot: string,
+  $GateIn: datetime
+)
+folder 'Live'
+begin
+  $Trip = create TripPlanning.Trip (
+    TruckId = $TruckId,
+    Vendor = $Vendor,
+    Slot = $Slot,
+    GateIn = $GateIn,
+    Status = TripPlanning.TripStatus.Waiting,
+    NextSeq = 1
+  );
+  commit $Trip;
+
+  retrieve $Plan from TripPlanning.VendorSlotPlan
+    where [Vendor = $Vendor and Slot = $Slot and IsActive = true and Weekday = 'All']
+    limit 1;
+  if $Plan = empty then
+    change $Trip (Status = TripPlanning.TripStatus.Hot);
+    commit $Trip;
+    call microflow TripPlanning.SUB_Log (Trip = $Trip, Type = 'Hot', Reason = 'No active plan');
+    return;
+  end if;
+  change $Trip (Trip_VendorSlotPlan = $Plan);
+  commit $Trip;
+
+  $Off = call java action TripPlanning.MinutesFromSlot (Slot = $Slot, At = $GateIn);
+  if $Off > $Plan/HardStopOffset then
+    change $Trip (Status = TripPlanning.TripStatus.Withdrawn);
+    commit $Trip;
+    call microflow TripPlanning.SUB_Log (Trip = $Trip, Type = 'Withdrawn', Reason = 'Arrived after hard stop');
+  else
+    if $Off >= $Plan/SafeStartOffset then
+      call microflow TripPlanning.AllocateNextStop (Trip = $Trip);
+    end if;
+  end if;
+  return;
+end;
+
+/** Call when the occupancy feed reports a bay turned free */
+create microflow TripPlanning.OnBayFree ($BayCode: string)
+folder 'Live'
+begin
+  retrieve $Bay from TripPlanning.Bay where [Code = $BayCode] limit 1;
+  if $Bay = empty then
+    return;
+  end if;
+  change $Bay (Occupied = false, ReservedUntil = [%CurrentDateTime%]);
+  commit $Bay;
+
+  -- close the allocation on this bay and move that truck to its next stop
+  retrieve $Open from TripPlanning.Allocation
+    where [Allocation_Bay = $Bay and ActualEnd = empty]
+    sort by Start desc
+    limit 1;
+  loop $A in $Open begin
+    change $A (ActualEnd = [%CurrentDateTime%]);
+    commit $A;
+    retrieve $T from $A/TripPlanning.Allocation_Trip;
+    call microflow TripPlanning.AllocateNextStop (Trip = $T);
+  end loop;
+
+  -- oldest hot trips get the next chance at the freed bay
+  retrieve $Hot from TripPlanning.Trip
+    where [Status = 'Hot']
+    sort by GateIn asc
+    limit 20;
+  loop $H in $Hot begin
+    call microflow TripPlanning.AllocateNextStop (Trip = $H);
+  end loop;
+  return;
+end;
+
+/** Every 5 minutes: release waiting trucks at safe start, withdraw past hard stop,
+ *  flag overruns */
+create microflow TripPlanning.SE_Sweep ()
+folder 'Live'
+begin
+  retrieve $Waiting from TripPlanning.Trip where [Status = 'Waiting'];
+  loop $T in $Waiting begin
+    retrieve $Plan from $T/TripPlanning.Trip_VendorSlotPlan;
+    if $Plan != empty then
+      declare $Slot string = $T/Slot;
+      $Off = call java action TripPlanning.MinutesFromSlot (Slot = $Slot, At = [%CurrentDateTime%]);
+      if $Off > $Plan/HardStopOffset then
+        change $T (Status = TripPlanning.TripStatus.Withdrawn);
+        commit $T;
+        call microflow TripPlanning.SUB_Log (Trip = $T, Type = 'Withdrawn', Reason = 'Not allocated before hard stop');
+      else
+        if $Off >= $Plan/SafeStartOffset then
+          call microflow TripPlanning.AllocateNextStop (Trip = $T);
+        end if;
+      end if;
+    end if;
+  end loop;
+
+  retrieve $Over from TripPlanning.Allocation
+    where [ActualEnd = empty and OverrunLogged = false
+           and ExpectedEnd < [%CurrentDateTime%]];
+  loop $A in $Over begin
+    retrieve $OT from $A/TripPlanning.Allocation_Trip;
+    call microflow TripPlanning.SUB_Log (Trip = $OT, Type = 'Overrun', Reason = 'Still at bay past expected end');
+    change $A (OverrunLogged = true);
+    commit $A;
+  end loop;
+  return;
+end;
+
+create scheduled event TripPlanning.Sweep (
+  Microflow: TripPlanning.SE_Sweep,
+  Repeat: Minutely,
+  Multiplier: 5,
+  OnOverlap: SkipNext,
+  Enabled: false
+);

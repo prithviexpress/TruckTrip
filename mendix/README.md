@@ -21,6 +21,20 @@ Not validated here: I could not run `mxcli check` in this environment. Expect a
 syntax nit or two on the first run; the statement forms follow the mxcli docs and
 examples in the repo.
 
+## Live allocation (second script)
+`tripplanning_live.mdl` adds the gate-time decision: `OnGateEntry` (call from the
+truck-entry alert), `AllocateNextStop`, `OnBayFree` (call from the bay occupancy feed),
+`SE_Sweep` (every 5 min, disabled until enabled), `BayFallback` rows, Trip, Allocation
+and ExceptionLog. Run it after `tripplanning.mdl`:
+```
+mxcli check mendix/tripplanning_live.mdl
+mxcli -p path/to/App.mpr -c "execute script 'mendix/tripplanning_live.mdl'"
+```
+Load `BayFallback` from `fallback_map.csv` (Download fallback map in the Bay schedule
+tab): one row per bay-fallback pair, `Rank` = position in the list.
+Still to wire in Studio Pro: the two integrations (truck-entry alert -> `OnGateEntry`,
+occupancy feed -> `Bay.Occupied` and `OnBayFree`) and a yard page on Trip/Allocation.
+
 ## What runs
 - `SE_GeneratePlan`: retires the active plan, runs `GeneratePlan` for all days and
   once per weekday. Scheduled weekly (Sunday 22:00, disabled until you enable it);
