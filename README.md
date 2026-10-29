@@ -4,14 +4,12 @@ Streamlit tools for Nagare truck data (`nagare_data.parquet`, kept out of git).
 
 | App | What it does |
 |---|---|
-| `nagare_trip_report.py` | Supply time → Trip → Item × Day table for one month; Excel export with one tab per month |
 | `vendor_trip_planner.py` | Min / typical / max trips per vendor, by weekday and supply slot, plus trips from planned quantity; Excel export |
-| `trip_demand_analysis.py` | PLAN tab (trips per supply slot, real gate-entry window, materials to expect), arrival profile, materials per slot, day detail with part-deliveries (10/15 5/15), demand drivers; Window planner (per-vendor arrival windows, replay test, hot bays, yard rules, yard sheet export); Bay schedule (safe start, hard stop and indicative bay windows per vendor and slot, with replay; stop length from your own pack size / unloading-time standards plus allowances; fallback bays within +-N numbers with a free-neighbour reserve, hot trips and optional hot-lane bays, replay of past gate entries with and without fallback); date-range filter; Excel export |
+| `trip_demand_analysis.py` | PLAN tab (trips per supply slot, real gate-entry window, materials to expect), arrival profile, materials per slot, day detail with part-deliveries (10/15 5/15), demand drivers; Trip report (Supply time → Trip → Item × Day per month, Excel one tab per month); Window planner (per-vendor arrival windows, replay test, hot bays, yard rules, yard sheet export); Bay schedule (safe start, hard stop and indicative bay windows per vendor and slot, with replay; stop length from your own pack size / unloading-time standards plus allowances; fallback bays within +-N numbers with a free-neighbour reserve, hot trips and optional hot-lane bays, replay of past gate entries with and without fallback); date-range filter; Excel export |
 
 ## Run
 ```
 pip install -r requirements.txt
-streamlit run nagare_trip_report.py
 streamlit run vendor_trip_planner.py
 streamlit run trip_demand_analysis.py
 ```

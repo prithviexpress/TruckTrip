@@ -8,24 +8,30 @@ Answers the planning questions from nagare_data.parquet:
   * Arrival: gate entry vs supply time, and trucks per clock-hour at the gate
   * Materials per slot, and day detail with part-deliveries
   * What conditions push trip counts up (weekday, month position, planned qty)
+  * Trip report: Supply time -> Trip -> Item x Day for a month, with Excel export
 
 Install:  pip install streamlit pandas pyarrow openpyxl numpy
 Run:      streamlit run trip_demand_analysis.py
 """
 
+import html
 import io
 import math
 import re
+from collections import Counter
 
 import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 DEFAULT_PATH = "nagare_data.parquet"
 COLS = ["Schedule_no", "Item", "Item_name", "Vendor_code", "unloading_loc", "Nag_date",
         "Supply_Time", "Nag_qty", "Received_qty", "Truck_number",
-        "Consignement_no", "Gate_entry_time", "Gate_Out_time"]
+        "Consignement_no", "Gate_entry_time", "Gate_Out_time", "location"]
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MAX_EARLY_H = 12     # arrivals earlier than this before the slot are treated as
 MAX_LATE_H = 12      # a different schedule's truck (or a data error), not this one
@@ -46,6 +52,8 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
                                              format="%d-%b-%Y %H:%M", errors="coerce")
     df["Supply_Time"] = df["Supply_Time"].astype(str).str.strip().str.slice(0, 5)
     df["unloading_loc"] = df["unloading_loc"].fillna("").astype(str).str.strip()
+    if "location" in df.columns:
+        df["location"] = df["location"].fillna("").astype(str).str.strip()
     df["Schedule_no"] = df["Schedule_no"].fillna("").astype(str).str.strip()
     df["Item"] = df["Item"].fillna("").astype(str).str.strip()
     df["Item_name"] = df["Item_name"].fillna("").astype(str).str.strip()
@@ -861,16 +869,21 @@ def to_excel(sheets: dict) -> bytes:
 # ----------------------------------------------------------------------------
 # Page
 # ----------------------------------------------------------------------------
-@st.cache_resource(show_spinner="Crunching trips, materials and bays…", max_entries=3)
-def analyse(path, dr, locs, vendors, split_loc, lo, plan_q, win, bucket, core, wd):
-    """All heavy tables, computed once per set of filters. The page below only
-    displays them, so tab switches and dropdowns don't recompute anything."""
+def filtered(path, dr, locs, vendors) -> pd.DataFrame:
     df = load(path)
     df = df[(df["Nag_date"] >= pd.Timestamp(dr[0])) & (df["Nag_date"] <= pd.Timestamp(dr[1]))]
     if locs:
         df = df[df["unloading_loc"].isin(locs)]
     if vendors:
         df = df[df["Vendor_code"].isin(vendors)]
+    return df
+
+
+@st.cache_resource(show_spinner="Crunching trips, materials and bays…", max_entries=3)
+def analyse(path, dr, locs, vendors, split_loc, lo, plan_q, win, bucket, core, wd):
+    """All heavy tables, computed once per set of filters. The page below only
+    displays them, so tab switches and dropdowns don't recompute anything."""
+    df = filtered(path, dr, locs, vendors)
     R = {"df": df}
     if df.empty:
         return R
@@ -1355,6 +1368,212 @@ RULES_LIST = [
 RULES = "\n".join(f"- {r}" for r in RULES_LIST)
 
 
+# ----------------------------------------------------------------------------
+# Trip report: Supply time -> Trip -> Item x Day, one month at a time
+# ----------------------------------------------------------------------------
+REPORT_QTY = ["Received_qty", "Planned qty (Nag_qty once per schedule line)"]
+
+
+def _fmt_gate(ts, day):
+    if ts is None or pd.isna(ts):
+        return ""
+    t = ts.strftime("%H:%M")
+    diff = (ts.normalize() - day).days
+    return t if diff == 0 else f"{t} ({diff:+d}d)"      # entry on another day
+
+
+def _fmt_qty(v):
+    if v is None or pd.isna(v):
+        return None
+    return int(v) if float(v).is_integer() else round(float(v), 2)
+
+
+def _month_days(period):
+    return list(pd.date_range(period.start_time, period.end_time.normalize(), freq="D"))
+
+
+def report_rows(m: pd.DataFrame, days, qty_mode: str):
+    """Rows for one month. A trip is one gate entry (a returning truck is a new
+    trip); trips are numbered Trip1, Trip2... per day + supply time by gate time."""
+    loc = "location" if "location" in m.columns else "unloading_loc"
+    m = m.assign(_loc=m[loc].astype(str), Item_name=m["Item_name"].astype(str))
+    if qty_mode == REPORT_QTY[0]:
+        m = m.assign(_q=m["Received_qty"])
+    else:   # Nag_qty repeats on every truck row of a line: count it once
+        m = m.sort_values("Gate_entry_time")
+        first = ~m.duplicated(["Schedule_no", "Item", "Nag_date", "Supply_Time"])
+        m = m.assign(_q=m["Nag_qty"].where(first))
+    trips = (m.groupby(["Nag_date", "Supply_Time", "trip_key"])["Gate_entry_time"].min()
+              .reset_index().rename(columns={"Gate_entry_time": "trip_gate"})
+              .sort_values(["Nag_date", "Supply_Time", "trip_gate"], na_position="last"))
+    trips["trip_no"] = trips.groupby(["Nag_date", "Supply_Time"]).cumcount() + 1
+    m = m.merge(trips[["Nag_date", "Supply_Time", "trip_key", "trip_no"]],
+                on=["Nag_date", "Supply_Time", "trip_key"])
+    gate = trips.pivot(index=["Supply_Time", "trip_no"], columns="Nag_date",
+                       values="trip_gate")
+    q = (m.groupby(["Supply_Time", "trip_no", "Item_name", "_loc", "Nag_date"])["_q"]
+          .sum(min_count=1).unstack("Nag_date"))
+    if qty_mode == REPORT_QTY[0]:
+        q = q.dropna(how="all")     # planned view keeps later parts as blank rows
+    qg = {k: g for k, g in q.groupby(level=[0, 1])}
+    rows = []
+    for (sup, trip), grow in gate.iterrows():
+        rows.append({"supply": sup, "trip": f"Trip{trip}", "item": "Gate entry",
+                     "loc": "", "kind": "gate",
+                     "vals": [_fmt_gate(grow.get(d), d) for d in days]})
+        for (_, _, item, lc), r in (qg.get((sup, trip)) if (sup, trip) in qg
+                                    else pd.DataFrame()).iterrows():
+            rows.append({"supply": sup, "trip": f"Trip{trip}", "item": item, "loc": lc,
+                         "kind": "item", "vals": [_fmt_qty(r.get(d)) for d in days]})
+    return rows
+
+
+@st.cache_resource(show_spinner="Building month…", max_entries=6)
+def report_month(path, dr, locs, vendors, month, qty_mode):
+    df = filtered(path, dr, locs, vendors)
+    period = pd.Period(month, "M")
+    m = df[df["Nag_date"].dt.to_period("M") == period]
+    days = _month_days(period)
+    return (report_rows(m, days, qty_mode) if len(m) else []), days
+
+
+REPORT_CSS = """
+<style>
+.nt-wrap{overflow:auto;max-height:75vh;border:1px solid #cfd6de}
+.nt{border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+.nt th,.nt td{border:1px solid #cfd6de;padding:3px 8px;white-space:nowrap}
+.nt thead th{position:sticky;top:0;background:#1f3a5f;color:#fff;z-index:2}
+.nt td.num{text-align:right}
+.nt td.grp{vertical-align:middle;text-align:center;font-weight:600;background:#eef2f6}
+.nt tr.gate td{background:#fff4d6;font-weight:600;color:#7a5200}
+.nt tr.gate td.lbl{font-style:italic;font-weight:500}
+</style>
+"""
+
+
+def report_html(rows, days):
+    sup_span = Counter(r["supply"] for r in rows)
+    trip_span = Counter((r["supply"], r["trip"]) for r in rows)
+    seen_s, seen_t = set(), set()
+    head = ("<tr><th>Supply time</th><th>Trip</th><th>Items</th><th>Location</th>"
+            + "".join(f"<th>{d:%d-%b}</th>" for d in days) + "</tr>")
+    body = []
+    for r in rows:
+        cells = []
+        if r["supply"] not in seen_s:
+            seen_s.add(r["supply"])
+            cells.append(f'<td class="grp" rowspan="{sup_span[r["supply"]]}">'
+                         f'{html.escape(r["supply"])}</td>')
+        key = (r["supply"], r["trip"])
+        if key not in seen_t:
+            seen_t.add(key)
+            cells.append(f'<td class="grp" rowspan="{trip_span[key]}">{r["trip"]}</td>')
+        cls = "lbl" if r["kind"] == "gate" else ""
+        cells.append(f'<td class="{cls}">{html.escape(r["item"])}</td>')
+        cells.append(f'<td>{html.escape(r["loc"])}</td>')
+        cells += [f'<td class="num">{"" if v is None else v}</td>' for v in r["vals"]]
+        body.append(f'<tr class="{r["kind"]}">{"".join(cells)}</tr>')
+    return (REPORT_CSS + '<div class="nt-wrap"><table class="nt"><thead>' + head
+            + "</thead><tbody>" + "".join(body) + "</tbody></table></div>")
+
+
+_THIN = Side(style="thin", color="A6B0BB")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_HEAD_FILL = PatternFill("solid", fgColor="1F3A5F")
+_GRP_FILL = PatternFill("solid", fgColor="EEF2F6")
+_GATE_FILL = PatternFill("solid", fgColor="FFF4D6")
+
+
+def write_report_sheet(ws, rows, days):
+    ws.append(["Supply time", "Trip", "Items", "Location"] + [d.strftime("%d-%b") for d in days])
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = _HEAD_FILL
+        c.alignment = Alignment(horizontal="center")
+        c.border = _BORDER
+    prev_s = prev_t = None
+    s_start = t_start = 2
+    merges = []
+    for i, r in enumerate(rows, start=2):
+        key_t = (r["supply"], r["trip"])
+        if r["supply"] != prev_s:
+            if prev_s is not None:
+                merges.append((1, s_start, i - 1))
+            s_start, prev_s = i, r["supply"]
+        if key_t != prev_t:
+            if prev_t is not None:
+                merges.append((2, t_start, i - 1))
+            t_start, prev_t = i, key_t
+        ws.append([r["supply"] if i == s_start else None,
+                   r["trip"] if i == t_start else None, r["item"], r["loc"]] + r["vals"])
+        for c in ws[i]:
+            c.border = _BORDER
+            if r["kind"] == "gate" and c.column > 2:
+                c.fill = _GATE_FILL
+                c.font = Font(bold=True, color="7A5200", italic=(c.column == 3))
+                c.alignment = Alignment(horizontal="center")
+    if rows:
+        merges += [(1, s_start, len(rows) + 1), (2, t_start, len(rows) + 1)]
+    for col, a, b in merges:
+        if b > a:
+            ws.merge_cells(start_row=a, end_row=b, start_column=col, end_column=col)
+        cell = ws.cell(row=a, column=col)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.font = Font(bold=True)
+        cell.fill = _GRP_FILL
+    for col, w in (("A", 12), ("B", 8), ("C", 38), ("D", 11)):
+        ws.column_dimensions[col].width = w
+    for j in range(5, 5 + len(days)):
+        ws.column_dimensions[get_column_letter(j)].width = 8
+    ws.freeze_panes = "E2"
+
+
+def report_excel(path, dr, locs, vendors, qty_mode) -> bytes:
+    df = filtered(path, dr, locs, vendors)
+    wb = Workbook()
+    wb.remove(wb.active)
+    for period in sorted(df["Nag_date"].dt.to_period("M").unique()):
+        m = df[df["Nag_date"].dt.to_period("M") == period]
+        days = _month_days(period)
+        write_report_sheet(wb.create_sheet(title=period.strftime("%b-%Y")),
+                           report_rows(m, days, qty_mode), days)
+    if not wb.sheetnames:
+        wb.create_sheet("No data")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def trip_report_tab(path, dr, locs, vendors, df):
+    st.markdown("Supply time, then each trip (one gate entry), then items by day for "
+                "one month. Days come from the supply date, not the gate-entry date; a "
+                "gate entry on another day shows as (+1d) or (-1d).")
+    months = sorted(df["Nag_date"].dt.to_period("M").unique())
+    c = st.columns(2)
+    month = c[0].selectbox("Month", months, index=len(months) - 1, key="rep_month",
+                           format_func=lambda p: p.strftime("%B %Y"))
+    qty_mode = c[1].radio("Quantity shown", REPORT_QTY, horizontal=True, key="rep_qty")
+    rows, days = report_month(path, tuple(dr), tuple(locs), tuple(vendors), str(month),
+                              qty_mode)
+    k = st.columns(3)
+    k[0].metric("Supply times", len({r["supply"] for r in rows}))
+    k[1].metric("Trips (max per slot)", len({(r["supply"], r["trip"]) for r in rows}))
+    k[2].metric("Item rows", sum(r["kind"] == "item" for r in rows))
+    if rows:
+        st.markdown(report_html(rows, days), unsafe_allow_html=True)
+    else:
+        st.info("No rows for this month with the current filters.")
+    if st.button("Prepare trip report Excel (one tab per month)", key="rep_btn"):
+        with st.spinner("Building Excel for all months…"):
+            st.session_state["rep_xl"] = report_excel(path, tuple(dr), tuple(locs),
+                                                       tuple(vendors), qty_mode)
+    if "rep_xl" in st.session_state:
+        st.download_button("Download trip report", st.session_state["rep_xl"],
+                           file_name="nagare_trip_report.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet")
+
+
 def make_plan_view(slots, aw, bays, keys, bay_cols, drop_by=False):
     """Trips to plan + gate-entry window (clock times) + bays, per `keys`."""
     if slots.empty:
@@ -1454,9 +1673,13 @@ def main():
         st.warning("Less than ~5 months of data in range: seasonality and "
                    "month-end effects are unreliable.")
 
-    tp, tw, tb, t1, t2, t4, t5, t3 = st.tabs(
-        ["PLAN", "Window planner", "Bay schedule", "Trips per supply time", "Gate entry vs supply time",
-         "Materials per slot", "Day detail", "What drives trips up"])
+    tp, tw, tb, t1, t2, t4, t5, tr, t3 = st.tabs(
+        ["PLAN", "Window planner", "Bay schedule", "Trips per supply time",
+         "Gate entry vs supply time", "Materials per slot", "Day detail", "Trip report",
+         "What drives trips up"])
+
+    with tr:
+        trip_report_tab(path, dr, locs, vendors, df)
 
     with tw:
         window_planner(R, df)
