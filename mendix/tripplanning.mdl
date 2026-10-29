@@ -1,0 +1,388 @@
+mdl 1;
+-- =============================================================================
+-- TripPlanning: safe start, hard stop, bay list and stop minutes per vendor+slot
+-- Mirrors trip_demand_analysis.py (Bay schedule tab). Apply with mxcli:
+--
+--   mxcli check mendix/tripplanning.mdl
+--   mxcli -p App.mpr -c "execute script 'mendix/tripplanning.mdl'"
+--
+-- Close Studio Pro first and commit your project before running.
+-- =============================================================================
+
+create module TripPlanning;
+
+-- MARK: SETTINGS -------------------------------------------------------------
+
+/** One row. Every number the plan depends on, editable by the yard lead. */
+@position(100, 100)
+create persistent entity TripPlanning.PlanSettings (
+  HistoryWeeks: integer not null default 10,
+  /** Safe start = this share of a vendor's trucks have arrived (0.80 = P80) */
+  QStart: decimal not null default 0.80,
+  /** Hard stop = this share arrived (0.95 = P95) plus GraceMin */
+  QStop: decimal not null default 0.95,
+  GraceMin: integer not null default 15,
+  RoundMin: integer not null default 15,
+  /** Fewer trucks than this in a slot: use the slot-wide timing instead */
+  MinTrucks: integer not null default 10,
+  /** Vendor-slots running on fewer % of days are not planned */
+  MinRunPct: integer not null default 20,
+  AllowancePct: integer not null default 15,
+  FixedMin: integer not null default 5,
+  /** Stop minutes sized on this percentile of past days (0.75 = P75) */
+  QStopMinutes: decimal not null default 0.75,
+  ManualMin: integer not null default 25,
+  GapMin: integer not null default 5,
+  EarlyCapH: integer not null default 12,
+  LateCapH: integer not null default 12
+);
+
+-- MARK: INPUTS ---------------------------------------------------------------
+
+/** One row per schedule line x truck, same as nagare_data.parquet */
+@position(400, 100)
+create persistent entity TripPlanning.GateEntry (
+  TruckId: string(30) not null,
+  Vendor: string(20) not null,
+  /** hh:mm */
+  Slot: string(5) not null,
+  SupplyDate: datetime not null,
+  GateIn: datetime,
+  GateOut: datetime,
+  Bay: string(20),
+  Item: string(40),
+  ReceivedQty: decimal,
+  PlannedQty: decimal,
+  ScheduleNo: string(30)
+)
+index (SupplyDate)
+index (Vendor, Slot);
+
+/** Pack size and standard unloading time per item */
+@position(700, 100)
+create persistent entity TripPlanning.ItemStandard (
+  Item: string(40) not null unique,
+  PackSize: decimal,
+  StdMinutes: decimal,
+  /** per pack | per piece | per stop */
+  Basis: string(20) default 'per pack',
+  IsCritical: boolean default false
+);
+
+@position(1000, 100)
+create persistent entity TripPlanning.Bay (
+  Code: string(20) not null unique,
+  IsHotLane: boolean default false
+);
+
+-- MARK: OUTPUTS --------------------------------------------------------------
+
+/** One row per vendor + slot (+ weekday) per plan version */
+@position(400, 400)
+create persistent entity TripPlanning.VendorSlotPlan (
+  Vendor: string(20) not null,
+  Slot: string(5) not null,
+  /** 'All' or MONDAY..SUNDAY */
+  Weekday: string(10) not null default 'All',
+  /** Minutes relative to the slot time; negative = before the slot */
+  SafeStartOffset: integer not null,
+  HardStopOffset: integer not null,
+  /** Clock text, e.g. 09:15 or 00:10 (+1d) */
+  SafeStart: string(12),
+  HardStop: string(12),
+  Basis: string(40),
+  TrucksInHistory: integer,
+  RunsPct: integer,
+  PlanVersion: integer not null,
+  GeneratedOn: datetime,
+  IsActive: boolean default true
+)
+index (Vendor, Slot, IsActive);
+
+/** Ordered bay stops of a plan row, with minutes per stop */
+@position(700, 400)
+create persistent entity TripPlanning.PlanStop (
+  Sequence: integer not null,
+  BayCode: string(20) not null,
+  StopMinutes: integer not null,
+  MinutesBasis: string(40),
+  IsCritical: boolean default false,
+  SharePct: integer
+);
+
+create association TripPlanning.PlanStop_VendorSlotPlan
+  from TripPlanning.PlanStop to TripPlanning.VendorSlotPlan
+  type reference delete_behavior CASCADE;
+
+create association TripPlanning.PlanStop_Bay
+  from TripPlanning.PlanStop to TripPlanning.Bay
+  type reference;
+
+-- MARK: JAVA ACTION ----------------------------------------------------------
+
+/**
+ * Computes the plan from GateEntry + ItemStandard and writes
+ * VendorSlotPlan + PlanStop. Returns rows written.
+ * Weekday: '' = all days, or MONDAY..SUNDAY.
+ */
+create java action TripPlanning.GeneratePlan (
+  Settings: TripPlanning.PlanSettings not null,
+  Weekday: string
+) returns long
+as $$
+import java.time.DayOfWeek;
+import java.time.Duration;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.stream.Collectors;
+import com.mendix.core.Core;
+import com.mendix.systemwideinterfaces.core.IContext;
+import com.mendix.systemwideinterfaces.core.IMendixObject;
+import tripplanning.proxies.GateEntry;
+import tripplanning.proxies.ItemStandard;
+import tripplanning.proxies.PlanStop;
+import tripplanning.proxies.VendorSlotPlan;
+
+IContext ctx = getContext();
+String wd = Weekday == null ? "" : Weekday.trim().toUpperCase();
+DayOfWeek dow = wd.isEmpty() ? null : DayOfWeek.valueOf(wd);
+LocalDate from = LocalDate.now().minusWeeks(Settings.getHistoryWeeks());
+ZoneId zone = ZoneId.systemDefault();
+
+// 1. Trips: one per truck + gate-entry time (a returning truck is a new trip)
+Map<String, Trip> trips = new HashMap<>();
+for (IMendixObject o : Core.retrieveXPathQuery(ctx,
+        "//TripPlanning.GateEntry[SupplyDate >= '" + from + "']")) {
+    GateEntry g = GateEntry.initialize(ctx, o);
+    if (g.getGateIn() == null || g.getSupplyDate() == null || g.getSlot() == null) continue;
+    LocalDate d = g.getSupplyDate().toInstant().atZone(zone).toLocalDate();
+    if (dow != null && d.getDayOfWeek() != dow) continue;
+    LocalDateTime in = LocalDateTime.ofInstant(g.getGateIn().toInstant(), zone);
+    Trip t = trips.computeIfAbsent(g.getTruckId() + "@" + in, k -> new Trip());
+    t.vendor = g.getVendor();
+    t.slot = g.getSlot();
+    t.date = d;
+    t.offset = Duration.between(d.atTime(LocalTime.parse(g.getSlot())), in).toMinutes();
+    if (g.getBay() != null) {
+        t.bays.add(g.getBay());
+        double q = g.getReceivedQty() == null ? 0 : g.getReceivedQty().doubleValue();
+        t.qty.computeIfAbsent(g.getBay(), k -> new HashMap<>()).merge(g.getItem(), q, Double::sum);
+    }
+}
+double earlyCap = -Settings.getEarlyCapH() * 60.0, lateCap = Settings.getLateCapH() * 60.0;
+List<Trip> kept = trips.values().stream()
+    .filter(t -> t.offset >= earlyCap && t.offset <= lateCap).collect(Collectors.toList());
+long allDays = kept.stream().map(t -> t.date).distinct().count();
+
+Map<String, ItemStandard> std = new HashMap<>();
+for (IMendixObject o : Core.retrieveXPathQuery(ctx, "//TripPlanning.ItemStandard")) {
+    ItemStandard is = ItemStandard.initialize(ctx, o);
+    std.put(is.getItem(), is);
+}
+Map<String, List<Double>> bySlot = new HashMap<>();
+for (Trip t : kept) bySlot.computeIfAbsent(t.slot, k -> new ArrayList<>()).add(t.offset);
+
+int version = 1;
+for (IMendixObject o : Core.retrieveXPathQuery(ctx, "//TripPlanning.VendorSlotPlan")) {
+    Integer v = VendorSlotPlan.initialize(ctx, o).getPlanVersion();
+    if (v != null && v >= version) version = v + 1;
+}
+
+// 2. Per vendor + slot
+Map<String, List<Trip>> groups = kept.stream().collect(Collectors.groupingBy(t -> t.vendor + "|" + t.slot));
+long written = 0;
+for (Map.Entry<String, List<Trip>> e : groups.entrySet()) {
+    String vendor = e.getKey().split("\\|")[0];
+    String slot = e.getKey().split("\\|")[1];
+    List<Trip> g = e.getValue();
+    long runDays = g.stream().map(t -> t.date).distinct().count();
+    int runsPct = (int) Math.round(100.0 * runDays / Math.max(allDays, 1));
+    if (runsPct < Settings.getMinRunPct()) continue;
+
+    List<Double> own = g.stream().map(t -> t.offset).sorted().collect(Collectors.toList());
+    boolean useOwn = own.size() >= Settings.getMinTrucks();
+    List<Double> src = useOwn ? own : bySlot.get(slot).stream().sorted().collect(Collectors.toList());
+    double a = pct(src, Settings.getQStart().doubleValue());
+    double b = pct(src, Settings.getQStop().doubleValue());
+    int round = Settings.getRoundMin();
+    int safe = (int) (Math.ceil(a / round) * round);
+    int hard = (int) (Math.ceil((b + Settings.getGraceMin()) / round) * round);
+
+    VendorSlotPlan p = new VendorSlotPlan(ctx);
+    p.setVendor(vendor);
+    p.setSlot(slot);
+    p.setWeekday(wd.isEmpty() ? "All" : wd);
+    p.setSafeStartOffset(safe);
+    p.setHardStopOffset(hard);
+    p.setSafeStart(clock(slot, safe));
+    p.setHardStop(clock(slot, hard));
+    p.setBasis(useOwn ? "Vendor history" : "Slot default (few trucks)");
+    p.setTrucksInHistory(own.size());
+    p.setRunsPct(runsPct);
+    p.setPlanVersion(version);
+    p.setGeneratedOn(new Date());
+    p.setIsActive(true);
+    p.commit();
+    written++;
+
+    // 3. Bay list: >= 10% of trips, top 5; critical bays first, then share
+    Map<String, Long> visits = new HashMap<>();
+    Set<String> critBay = new LinkedHashSet<>();
+    for (Trip t : g) {
+        for (String bay : t.bays) {
+            visits.merge(bay, 1L, Long::sum);
+            for (String it : t.qty.getOrDefault(bay, new HashMap<>()).keySet()) {
+                ItemStandard is = std.get(it);
+                if (is != null && Boolean.TRUE.equals(is.getIsCritical())) critBay.add(bay);
+            }
+        }
+    }
+    final int n = g.size();
+    List<Map.Entry<String, Long>> bays = visits.entrySet().stream()
+        .filter(x -> 100.0 * x.getValue() / n >= 10)
+        .sorted(Comparator.<Map.Entry<String, Long>>comparingInt(x -> critBay.contains(x.getKey()) ? 0 : 1)
+                .thenComparing(x -> -x.getValue()))
+        .limit(5).collect(Collectors.toList());
+
+    int seq = 0;
+    for (Map.Entry<String, Long> bv : bays) {
+        String bay = bv.getKey();
+        // 4. Stop minutes: P75 of past days of standard minutes + allowance + fixed
+        List<Double> dayMins = new ArrayList<>();
+        double qStd = 0, qAll = 0;
+        for (Trip t : g) {
+            Map<String, Double> items = t.qty.get(bay);
+            if (items == null) continue;
+            double m = 0;
+            for (Map.Entry<String, Double> it : items.entrySet()) {
+                double q = it.getValue();
+                qAll += q;
+                ItemStandard is = std.get(it.getKey());
+                if (is == null || is.getStdMinutes() == null) continue;
+                double tm = is.getStdMinutes().doubleValue();
+                double ps = is.getPackSize() == null ? 0 : is.getPackSize().doubleValue();
+                String basis = is.getBasis() == null ? "per pack" : is.getBasis();
+                if (basis.equals("per piece")) m += q * tm;
+                else if (basis.equals("per stop")) m += q > 0 ? tm : 0;
+                else if (ps > 0) m += Math.ceil(q / ps) * tm;
+                else continue;
+                qStd += q;
+            }
+            dayMins.add(m);
+        }
+        int mins;
+        String mb;
+        if (qAll > 0 && qStd / qAll >= 0.5 && !dayMins.isEmpty()) {
+            double raw = pct(dayMins.stream().sorted().collect(Collectors.toList()),
+                             Settings.getQStopMinutes().doubleValue());
+            mins = (int) (Math.ceil((raw * (1 + Settings.getAllowancePct() / 100.0) + Settings.getFixedMin()) / 5) * 5);
+            mb = "Your standard";
+        } else {
+            mins = Settings.getManualMin();
+            mb = "Manual (no standard)";
+        }
+        PlanStop ps = new PlanStop(ctx);
+        ps.setSequence(++seq);
+        ps.setBayCode(bay);
+        ps.setStopMinutes(mins);
+        ps.setMinutesBasis(mb);
+        ps.setIsCritical(critBay.contains(bay));
+        ps.setSharePct((int) Math.round(100.0 * bv.getValue() / n));
+        ps.setPlanStop_VendorSlotPlan(p);
+        List<IMendixObject> bo = Core.retrieveXPathQuery(ctx,
+            "//TripPlanning.Bay[Code = '" + bay.replace("'", "''") + "']");
+        if (!bo.isEmpty()) ps.setPlanStop_Bay(tripplanning.proxies.Bay.initialize(ctx, bo.get(0)));
+        ps.commit();
+    }
+}
+return written;
+$$
+extra code $$
+private static final class Trip {
+    String vendor, slot;
+    java.time.LocalDate date;
+    double offset;
+    java.util.Set<String> bays = new java.util.LinkedHashSet<>();
+    java.util.Map<String, java.util.Map<String, Double>> qty = new java.util.HashMap<>();
+}
+
+/** Linear-interpolated percentile of a sorted list (pandas default). */
+private static double pct(java.util.List<Double> sorted, double q) {
+    if (sorted.isEmpty()) return 0;
+    double pos = q * (sorted.size() - 1);
+    int lo = (int) Math.floor(pos), hi = (int) Math.ceil(pos);
+    return sorted.get(lo) + (sorted.get(hi) - sorted.get(lo)) * (pos - lo);
+}
+
+/** Slot hh:mm plus offset minutes as clock text; (+1d)/(-1d) when it rolls over. */
+private static String clock(String slot, int offset) {
+    int h = Integer.parseInt(slot.substring(0, 2)), m = Integer.parseInt(slot.substring(3, 5));
+    int t = h * 60 + m + offset;
+    int day = Math.floorDiv(t, 1440);
+    t = Math.floorMod(t, 1440);
+    String s = String.format("%02d:%02d", t / 60, t % 60);
+    return day == 0 ? s : s + " (" + (day > 0 ? "+" : "") + day + "d)";
+}
+$$;
+
+-- MARK: MICROFLOWS -----------------------------------------------------------
+
+/** Retire the active plan and generate a new version (all days + each weekday). */
+create microflow TripPlanning.SE_GeneratePlan ()
+folder 'Plan'
+begin
+  retrieve $Settings from TripPlanning.PlanSettings first;
+  if $Settings = empty then
+    $Settings = create TripPlanning.PlanSettings ();
+    commit $Settings;
+  end if;
+
+  retrieve $Active from TripPlanning.VendorSlotPlan where IsActive = true;
+  loop $Old in $Active begin
+    change $Old (IsActive = false);
+    commit $Old;
+  end loop;
+
+  $Rows = call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = '');
+  log info node 'TripPlanning' 'Plan rows written (all days): {1}' with ({1} = toString($Rows));
+
+  -- One plan per weekday too, used when the yard plans a specific day
+  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'MONDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'TUESDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'WEDNESDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'THURSDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'FRIDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'SATURDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'SUNDAY');
+  return;
+end;
+
+/** Same as the scheduled event, for a button on the settings page. */
+create microflow TripPlanning.ACT_GeneratePlanNow ()
+folder 'Plan'
+begin
+  call microflow TripPlanning.SE_GeneratePlan ();
+  return;
+end;
+
+create scheduled event TripPlanning.WeeklyPlan (
+  Microflow: TripPlanning.SE_GeneratePlan,
+  Repeat: Weekly,
+  Weekdays: 'Sunday',
+  HourOfDay: 22,
+  MinuteOfHour: 0,
+  TimeZone: Server,
+  OnOverlap: SkipNext,
+  Enabled: false
+);

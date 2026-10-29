@@ -1,50 +1,43 @@
-# TripPlanning in Mendix
+# TripPlanning in Mendix (via mxcli)
 
-What the Python app computes (safe start, hard stop, bay list, stop minutes), rebuilt
-so Mendix owns the plan. Mendix has no text model format to import; the pieces are:
+`tripplanning.mdl` rebuilds the plan step of `trip_demand_analysis.py` inside Mendix:
+safe start, hard stop, bay list and stop minutes per vendor + slot, as a module
+`TripPlanning` with entities, one Java action, two microflows and a weekly scheduled
+event. Written for [mxcli](https://github.com/mendixlabs/mxcli) (Mendix Labs, alpha,
+tested by them on Mendix 11.6).
 
-| File | What it is |
-|---|---|
-| `create_model.ts` | Mendix **Model SDK** script: creates module `TripPlanning` with the domain model in your Team Server app |
-| `GeneratePlan.java` | Java action that computes the plan from `GateEntry` + `ItemStandard` and writes `VendorSlotPlan` + `PlanStop` |
-
-## 1. Domain model via the Model SDK
+## Apply
 ```
-cd mendix
-npm install
-export MENDIX_TOKEN=<Personal Access Token: Mendix Profile -> Developer Settings, scope mx:modelrepository:repo:write>
-npx tsx create_model.ts <AppId>            # AppId: Sprintr app settings -> General -> App ID
+# 1. install mxcli: download mxcli-<os>-<arch> from the releases page (nightly), chmod +x
+# 2. close Studio Pro, commit your project
+mxcli check mendix/tripplanning.mdl                              # syntax + rules
+mxcli -p path/to/App.mpr -c "execute script 'mendix/tripplanning.mdl'"
+mxcli -p path/to/App.mpr -c "describe java action TripPlanning.GeneratePlan"
+# 3. reopen in Studio Pro, build (F7). Fix any Java compile error in the generated
+#    javasource/tripplanning/actions/GeneratePlan.java, then re-import with
+#    'create or modify java action' if you want the .mdl to stay the source.
 ```
-Pull the branch in Studio Pro. Untested against a live Team Server; if a call fails,
-compare with https://apidocs.rnd.mendix.com/modelsdk/latest/ for your SDK version.
-Doing the same by hand in Studio Pro takes under an hour (10 entities, 9 associations).
+Not validated here: I could not run `mxcli check` in this environment. Expect a
+syntax nit or two on the first run; the statement forms follow the mxcli docs and
+examples in the repo.
 
-## 2. Java action in Studio Pro
-1. In module TripPlanning add a Java action `GeneratePlan`, parameters
-   `Settings : PlanSettings` (object) and `Weekday : String`, return `Long`.
-2. Studio Pro generates `javasource/tripplanning/actions/GeneratePlan.java`;
-   replace its body with this file, keep the generated header/constructor if they differ.
-3. Deploy for Eclipse / run locally once so proxies are generated.
+## What runs
+- `SE_GeneratePlan`: retires the active plan, runs `GeneratePlan` for all days and
+  once per weekday. Scheduled weekly (Sunday 22:00, disabled until you enable it);
+  `ACT_GeneratePlanNow` wraps it for a button.
+- `GeneratePlan` (Java): trips = truck + gate-entry time; drops entries more than
+  EarlyCapH/LateCapH hours from the slot; safe start = P(QStart) rounded up, hard stop
+  = P(QStop) + grace rounded up; slot-wide fallback under MinTrucks; bay list = bays on
+  >= 10% of trips, top 5, critical first; stop minutes = P(QStopMinutes) of daily
+  standard minutes x (1 + allowance) + fixed, rounded up to 5, else ManualMin.
+  Same percentile math as the Python (linear interpolation).
 
-## 3. Microflows (hand-built, small)
-- `SE_GeneratePlan` (scheduled event, weekly): retrieve the single `PlanSettings`,
-  set `IsActive=false` on current plans, call `GeneratePlan(Settings, '')`, optionally
-  loop the 7 weekdays with `GeneratePlan(Settings, 'MONDAY')`.
-- `ACT_ReplayPlan` (optional): same Java action over history minus the last 14 days,
-  then count `Trip` rows in those 14 days before SafeStart / after HardStop. Do not
-  activate a plan whose withdrawals per day exceed what the yard accepts.
-- Live allocation (`OnGateEntry`, `AllocateNextStop`, `OnBayFree`, `SweepTimers`) as
-  described in the design notes; they only read `VendorSlotPlan`/`PlanStop`.
+## Data loads
+- `GateEntry`: the parquet rows (Excel/CSV import or REST).
+- `ItemStandard`: pack size, standard minutes, basis, IsCritical.
+- `Bay`: codes; `IsHotLane` for reserved bays.
+- `PlanSettings`: created with defaults on first run; edit on a page.
 
-## 4. Data loads
-- `GateEntry`: the same rows as `nagare_data.parquet` (Excel/CSV import or REST).
-- `ItemStandard`: your pack-size / unloading-time sheet, with `IsCritical`.
-- `Bay` + `BayFallback`: from `fallback_map.csv` exported by the Python app.
-- `PlanSettings`: one row. Defaults: HistoryWeeks 10, QStart 0.80, QStop 0.95,
-  GraceMin 15, RoundMin 15, MinTrucks 10, MinRunPct 20, AllowancePct 15, FixedMin 5,
-  QStopMinutes 0.75, ManualMin 25, GapMin 5, EarlyCapH 12, LateCapH 12, FallbackRange 2.
-
-## 5. Cross-check before go-live
-Run the Python app and `GeneratePlan` on the same history window and diff
-`VendorSlotPlan` against the "Safe start & hard stop" sheet. Percentile math is the
-same (linear interpolation), so differences point to data-load issues.
+## Cross-check before go-live
+Run the Python app on the same history window and diff `VendorSlotPlan` against the
+"Safe start & hard stop" sheet. Differences point to data-load issues, not math.
