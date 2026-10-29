@@ -347,7 +347,7 @@ create microflow TripPlanning.SUB_GetSettings ()
 returns TripPlanning.PlanSettings as $Settings
 folder 'Plan'
 begin
-  retrieve $Settings from TripPlanning.PlanSettings limit 1;
+  retrieve $Settings from TripPlanning.PlanSettings first;
   if $Settings = empty then
     $NewSettings = create TripPlanning.PlanSettings ();
     commit $NewSettings;

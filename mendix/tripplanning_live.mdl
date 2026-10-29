@@ -53,7 +53,7 @@ create persistent entity TripPlanning.Allocation (
 );
 
 create persistent entity TripPlanning.ExceptionLog (
-  Type: string(30),
+  ExceptionType: string(30),
   Reason: string(200),
   LoggedAt: datetime,
   Who: string(50)
@@ -101,7 +101,7 @@ create microflow TripPlanning.SUB_Log (
 folder 'Live'
 begin
   $L = create TripPlanning.ExceptionLog (
-    Type = $Type,
+    ExceptionType = $Type,
     Reason = $Reason,
     LoggedAt = [%CurrentDateTime%]
   );
@@ -118,7 +118,7 @@ begin
   retrieve $Bay from TripPlanning.Bay
     where [Code = $Code and Occupied = false
            and (ReservedUntil = empty or ReservedUntil <= [%CurrentDateTime%])]
-    limit 1;
+    first;
   return $Bay;
 end;
 
@@ -132,7 +132,7 @@ create microflow TripPlanning.SUB_Allocate (
 )
 folder 'Live'
 begin
-  retrieve $Settings from TripPlanning.PlanSettings limit 1;
+  retrieve $Settings from TripPlanning.PlanSettings first;
   declare $End datetime = addMinutes([%CurrentDateTime%], $Stop/StopMinutes);
   $A = create TripPlanning.Allocation (
     Start = [%CurrentDateTime%],
@@ -175,7 +175,7 @@ begin
   declare $Next integer = $Trip/NextSeq;
   retrieve $Stop from TripPlanning.PlanStop
     where [PlanStop_VendorSlotPlan = $Plan and Sequence = $Next]
-    limit 1;
+    first;
   if $Stop = empty then
     change $Trip (Status = TripPlanning.TripStatus.Done);
     commit $Trip;
@@ -191,7 +191,7 @@ begin
   end if;
 
   -- 2. fallback bays, nearest first; hot-lane bays are not fallbacks
-  retrieve $PlanBay from TripPlanning.Bay where [Code = $Code] limit 1;
+  retrieve $PlanBay from TripPlanning.Bay where [Code = $Code] first;
   declare $Done boolean = false;
   if $PlanBay != empty then
     retrieve $Fallbacks from TripPlanning.BayFallback
@@ -220,7 +220,7 @@ begin
   retrieve $HotBay from TripPlanning.Bay
     where [IsHotLane = true and Occupied = false
            and (ReservedUntil = empty or ReservedUntil <= [%CurrentDateTime%])]
-    limit 1;
+    first;
   if $HotBay != empty then
     call microflow TripPlanning.SUB_Allocate (Trip = $Trip, Stop = $Stop, Bay = $HotBay, Swapped = true, Reason = 'Hot lane');
   else
@@ -252,7 +252,7 @@ begin
 
   retrieve $Plan from TripPlanning.VendorSlotPlan
     where [Vendor = $Vendor and Slot = $Slot and IsActive = true and DayOfWeek = 'All']
-    limit 1;
+    first;
   if $Plan = empty then
     change $Trip (Status = TripPlanning.TripStatus.Hot);
     commit $Trip;
@@ -279,7 +279,7 @@ end;
 create microflow TripPlanning.OnBayFree ($BayCode: string)
 folder 'Live'
 begin
-  retrieve $Bay from TripPlanning.Bay where [Code = $BayCode] limit 1;
+  retrieve $Bay from TripPlanning.Bay where [Code = $BayCode] first;
   if $Bay = empty then
     return;
   end if;
