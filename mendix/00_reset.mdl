@@ -1,0 +1,10 @@
+mdl 1;
+-- Removes the whole TripPlanning module so the two scripts can be applied again
+-- from scratch. Destroys everything in the module (entities, microflows, data
+-- model; runtime data is not touched until the app is next deployed with the
+-- schema change). Use it on a backed-up project only.
+--
+--   mxcli exec "mendix\00_reset.mdl" -p "D:\01 Project\50 MxCli\MxCli.mpr"
+--   mxcli exec "mendix\tripplanning.mdl" -p "D:\01 Project\50 MxCli\MxCli.mpr"
+--   mxcli exec "mendix\tripplanning_live.mdl" -p "D:\01 Project\50 MxCli\MxCli.mpr"
+drop module TripPlanning;

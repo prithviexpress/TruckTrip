@@ -174,7 +174,7 @@ begin
 
   declare $Next integer = $Trip/NextSeq;
   retrieve $Stop from TripPlanning.PlanStop
-    where [PlanStop_VendorSlotPlan = $Plan and Sequence = $Next]
+    where [TripPlanning.PlanStop_VendorSlotPlan = $Plan and Sequence = $Next]
     first;
   if $Stop = empty then
     change $Trip (Status = TripPlanning.TripStatus.Done);
@@ -195,7 +195,7 @@ begin
   declare $Done boolean = false;
   if $PlanBay != empty then
     retrieve $Fallbacks from TripPlanning.BayFallback
-      where [BayFallback_Bay = $PlanBay]
+      where [TripPlanning.BayFallback_Bay = $PlanBay]
       sort by Rank asc;
     loop $F in $Fallbacks begin
       retrieve $FBay from $F/TripPlanning.BayFallback_FallbackBay;
@@ -288,7 +288,7 @@ begin
 
   -- close the allocation on this bay and move that truck to its next stop
   retrieve $Open from TripPlanning.Allocation
-    where [Allocation_Bay = $Bay and ActualEnd = empty]
+    where [TripPlanning.Allocation_Bay = $Bay and ActualEnd = empty]
     sort by Start desc
     limit 1;
   loop $A in $Open begin

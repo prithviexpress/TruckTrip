@@ -21,6 +21,11 @@ Not validated here: I could not run `mxcli check` in this environment. Expect a
 syntax nit or two on the first run; the statement forms follow the mxcli docs and
 examples in the repo.
 
+## Re-running
+The scripts create the module, so a second run fails with "already exists". To start
+over, restore your backup, or run `00_reset.mdl` (drops module TripPlanning) and apply
+`tripplanning.mdl` then `tripplanning_live.mdl` again. Always quote paths with spaces.
+
 ## Live allocation (second script)
 `tripplanning_live.mdl` adds the gate-time decision: `OnGateEntry` (call from the
 truck-entry alert), `AllocateNextStop`, `OnBayFree` (call from the bay occupancy feed),
