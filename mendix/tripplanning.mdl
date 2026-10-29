@@ -87,7 +87,7 @@ create persistent entity TripPlanning.VendorSlotPlan (
   Vendor: string(20) not null,
   Slot: string(5) not null,
   /** 'All' or MONDAY..SUNDAY */
-  Weekday: string(10) not null default 'All',
+  DayOfWeek: string(10) not null default 'All',
   /** Minutes relative to the slot time; negative = before the slot */
   SafeStartOffset: integer not null,
   HardStopOffset: integer not null,
@@ -116,7 +116,7 @@ create persistent entity TripPlanning.PlanStop (
 
 create association TripPlanning.PlanStop_VendorSlotPlan
   from TripPlanning.PlanStop to TripPlanning.VendorSlotPlan
-  type reference delete_behavior CASCADE;
+  type reference on delete cascade;
 
 create association TripPlanning.PlanStop_Bay
   from TripPlanning.PlanStop to TripPlanning.Bay
@@ -226,7 +226,7 @@ for (Map.Entry<String, List<Trip>> e : groups.entrySet()) {
     VendorSlotPlan p = new VendorSlotPlan(ctx);
     p.setVendor(vendor);
     p.setSlot(slot);
-    p.setWeekday(wd.isEmpty() ? "All" : wd);
+    p.setDayOfWeek(wd.isEmpty() ? "All" : wd);
     p.setSafeStartOffset(safe);
     p.setHardStopOffset(hard);
     p.setSafeStart(clock(slot, safe));
@@ -342,33 +342,43 @@ $$;
 
 -- MARK: MICROFLOWS -----------------------------------------------------------
 
+/** The single settings row, created with defaults if missing */
+create microflow TripPlanning.SUB_GetSettings ()
+returns TripPlanning.PlanSettings as $Settings
+folder 'Plan'
+begin
+  retrieve $Settings from TripPlanning.PlanSettings limit 1;
+  if $Settings = empty then
+    $NewSettings = create TripPlanning.PlanSettings ();
+    commit $NewSettings;
+    return $NewSettings;
+  end if;
+  return $Settings;
+end;
+
 /** Retire the active plan and generate a new version (all days + each weekday). */
 create microflow TripPlanning.SE_GeneratePlan ()
 folder 'Plan'
 begin
-  retrieve $Settings from TripPlanning.PlanSettings first;
-  if $Settings = empty then
-    $Settings = create TripPlanning.PlanSettings ();
-    commit $Settings;
-  end if;
+  $Cfg = call microflow TripPlanning.SUB_GetSettings ();
 
-  retrieve $Active from TripPlanning.VendorSlotPlan where IsActive = true;
+  retrieve $Active from TripPlanning.VendorSlotPlan where [IsActive = true];
   loop $Old in $Active begin
     change $Old (IsActive = false);
-    commit $Old;
   end loop;
+  commit $Active;
 
-  $Rows = call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = '');
+  $Rows = call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = '');
   log info node 'TripPlanning' 'Plan rows written (all days): {1}' with ({1} = toString($Rows));
 
   -- One plan per weekday too, used when the yard plans a specific day
-  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'MONDAY');
-  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'TUESDAY');
-  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'WEDNESDAY');
-  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'THURSDAY');
-  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'FRIDAY');
-  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'SATURDAY');
-  call java action TripPlanning.GeneratePlan (Settings = $Settings, Weekday = 'SUNDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'MONDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'TUESDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'WEDNESDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'THURSDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'FRIDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'SATURDAY');
+  call java action TripPlanning.GeneratePlan (Settings = $Cfg, Weekday = 'SUNDAY');
   return;
 end;
 

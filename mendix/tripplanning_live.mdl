@@ -251,7 +251,7 @@ begin
   commit $Trip;
 
   retrieve $Plan from TripPlanning.VendorSlotPlan
-    where [Vendor = $Vendor and Slot = $Slot and IsActive = true and Weekday = 'All']
+    where [Vendor = $Vendor and Slot = $Slot and IsActive = true and DayOfWeek = 'All']
     limit 1;
   if $Plan = empty then
     change $Trip (Status = TripPlanning.TripStatus.Hot);
