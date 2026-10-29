@@ -1418,12 +1418,19 @@ def report_rows(m: pd.DataFrame, days, qty_mode: str):
     qg = {k: g for k, g in q.groupby(level=[0, 1])}
     rows = []
     for (sup, trip), grow in gate.iterrows():
-        rows.append({"supply": sup, "trip": f"Trip{trip}", "item": "Gate entry",
+        # gate-entry habit of this trip across the month, as minutes from the
+        # supply date so an entry after midnight sorts after a late-evening one
+        mins = pd.Series([(g - d).total_seconds() / 60 for d, g in grow.items()
+                          if pd.notna(g)])
+        label = (f"Trip{trip}\nfrom {slot_clock('00:00', mins.min())}\n"
+                 f"median {slot_clock('00:00', mins.median())}\n"
+                 f"last {slot_clock('00:00', mins.max())}" if len(mins) else f"Trip{trip}")
+        rows.append({"supply": sup, "trip": label, "item": "Gate entry",
                      "loc": "", "kind": "gate",
                      "vals": [_fmt_gate(grow.get(d), d) for d in days]})
         for (_, _, item, lc), r in (qg.get((sup, trip)) if (sup, trip) in qg
                                     else pd.DataFrame()).iterrows():
-            rows.append({"supply": sup, "trip": f"Trip{trip}", "item": item, "loc": lc,
+            rows.append({"supply": sup, "trip": label, "item": item, "loc": lc,
                          "kind": "item", "vals": [_fmt_qty(r.get(d)) for d in days]})
     return rows
 
@@ -1445,6 +1452,8 @@ REPORT_CSS = """
 .nt thead th{position:sticky;top:0;background:#1f3a5f;color:#fff;z-index:2}
 .nt td.num{text-align:right}
 .nt td.grp{vertical-align:middle;text-align:center;font-weight:600;background:#eef2f6}
+.nt td.trip{font-weight:400;font-size:12px;line-height:1.35}
+.nt td.trip::first-line{font-weight:600}
 .nt tr.gate td{background:#fff4d6;font-weight:600;color:#7a5200}
 .nt tr.gate td.lbl{font-style:italic;font-weight:500}
 </style>
@@ -1467,7 +1476,8 @@ def report_html(rows, days):
         key = (r["supply"], r["trip"])
         if key not in seen_t:
             seen_t.add(key)
-            cells.append(f'<td class="grp" rowspan="{trip_span[key]}">{r["trip"]}</td>')
+            cells.append(f'<td class="grp trip" rowspan="{trip_span[key]}">'
+                         f'{html.escape(r["trip"]).replace(chr(10), "<br>")}</td>')
         cls = "lbl" if r["kind"] == "gate" else ""
         cells.append(f'<td class="{cls}">{html.escape(r["item"])}</td>')
         cells.append(f'<td>{html.escape(r["loc"])}</td>')
@@ -1518,10 +1528,11 @@ def write_report_sheet(ws, rows, days):
         if b > a:
             ws.merge_cells(start_row=a, end_row=b, start_column=col, end_column=col)
         cell = ws.cell(row=a, column=col)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.alignment = Alignment(horizontal="center", vertical="center",
+                                   wrap_text=(col == 2))
         cell.font = Font(bold=True)
         cell.fill = _GRP_FILL
-    for col, w in (("A", 12), ("B", 8), ("C", 38), ("D", 11)):
+    for col, w in (("A", 12), ("B", 14), ("C", 38), ("D", 11)):
         ws.column_dimensions[col].width = w
     for j in range(5, 5 + len(days)):
         ws.column_dimensions[get_column_letter(j)].width = 8
@@ -1558,6 +1569,8 @@ def trip_report_tab(path, dr, locs, vendors, df):
     k = st.columns(3)
     k[0].metric("Supply times", len({r["supply"] for r in rows}))
     k[1].metric("Trips (max per slot)", len({(r["supply"], r["trip"]) for r in rows}))
+    st.caption("Trip cell: from = earliest gate entry of that trip in the month, median "
+               "= typical, last = latest; (+1d) means after midnight.")
     k[2].metric("Item rows", sum(r["kind"] == "item" for r in rows))
     if rows:
         st.markdown(report_html(rows, days), unsafe_allow_html=True)
