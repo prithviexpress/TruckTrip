@@ -1,0 +1,318 @@
+mdl 1;
+-- =============================================================================
+-- TripPlanning pages: see what the plan and the live allocation are doing.
+-- Run after tripplanning.mdl and tripplanning_live.mdl. Uses Atlas_Core layouts
+-- (part of a standard Mendix app).
+--
+--   mxcli check "mendix\tripplanning_pages.mdl"
+--   mxcli exec  "mendix\tripplanning_pages.mdl" -p "<your .mpr>"
+--
+-- Afterwards add the pages to the navigation in Studio Pro (Navigation ->
+-- menu items): Plan_Overview, Trips_Board, Bays_Board, Allocations_Log,
+-- Exceptions_Log, PlanRun_Log, Settings_Overview, ItemStandard_Overview.
+-- =============================================================================
+
+-- MARK: HELPER MICROFLOWS ----------------------------------------------------
+
+create microflow TripPlanning.ACT_ItemStandard_New ()
+folder 'Pages'
+begin
+  $Item = create TripPlanning.ItemStandard (
+    Basis = 'per pack',
+    IsCritical = false
+  );
+  show page TripPlanning.ItemStandard_Edit ($ItemStandard = $Item);
+  return;
+end;
+
+create microflow TripPlanning.ACT_Bay_New ()
+folder 'Pages'
+begin
+  $Bay = create TripPlanning.Bay (
+    IsHotLane = false,
+    Occupied = false
+  );
+  show page TripPlanning.Bay_Edit ($Bay = $Bay);
+  return;
+end;
+
+-- MARK: PLAN: what was decided and why ---------------------------------------
+
+/** All plan rows. Start here: generate, then open a row to see its bays. */
+create page TripPlanning.Plan_Overview folder 'Plan'
+(
+  Title: 'Trip plan',
+  Layout: Atlas_Core.Atlas_Default
+)
+{
+  datagrid dgPlan (DataSource: database TripPlanning.VendorSlotPlan, PageSize: 30) {
+    column (Attribute: Vendor, Caption: 'Vendor')
+    column (Attribute: Slot, Caption: 'Slot')
+    column (Attribute: DayOfWeek, Caption: 'Day')
+    column (Attribute: SafeStart, Caption: 'Safe start')
+    column (Attribute: HardStop, Caption: 'Hard stop')
+    column (Attribute: Basis, Caption: 'Based on')
+    column (Attribute: TrucksInHistory, Caption: 'Trucks')
+    column (Attribute: RunsPct, Caption: 'Runs % of days')
+    column (Attribute: PlanVersion, Caption: 'Version')
+    column (Attribute: IsActive, Caption: 'Active')
+    controlbar {
+      actionbutton btnGen (
+        Caption: 'Generate plan now',
+        Action: call microflow TripPlanning.ACT_GeneratePlanNow,
+        ButtonStyle: Primary
+      )
+      actionbutton btnOpen (Caption: 'Open bays and stops', Action: show page TripPlanning.Plan_Detail)
+      actionbutton btnWhy (Caption: 'Why this plan?', Action: show page TripPlanning.PlanRun_Log)
+    }
+  }
+};
+
+/** One plan row with its ordered bay stops and minutes per stop */
+create page TripPlanning.Plan_Detail folder 'Plan'
+(
+  Params: ( $Plan: TripPlanning.VendorSlotPlan ),
+  Title: 'Plan detail',
+  Layout: Atlas_Core.Atlas_Default
+)
+{
+  dataview dvPlan (DataSource: $Plan) {
+    layoutgrid gridPlan {
+      row {
+        column {
+          textbox txtVendor (Label: 'Vendor', Attribute: Vendor, Editable: never)
+          textbox txtSlot (Label: 'Slot', Attribute: Slot, Editable: never)
+          textbox txtDay (Label: 'Day', Attribute: DayOfWeek, Editable: never)
+        }
+        column {
+          textbox txtSafe (Label: 'Safe start', Attribute: SafeStart, Editable: never)
+          textbox txtHard (Label: 'Hard stop (withdraw slot)', Attribute: HardStop, Editable: never)
+          textbox txtBasis (Label: 'Based on', Attribute: Basis, Editable: never)
+        }
+      }
+    }
+    footer {
+      actionbutton btnBack (Caption: 'Back', Action: close page)
+    }
+  }
+  datagrid dgStops (
+    DataSource: database from TripPlanning.PlanStop
+      where [TripPlanning.PlanStop_VendorSlotPlan = $Plan]
+      sort by Sequence asc,
+    PageSize: 10
+  ) {
+    column (Attribute: Sequence, Caption: 'Stop')
+    column (Attribute: BayCode, Caption: 'Bay')
+    column (Attribute: StopMinutes, Caption: 'Minutes')
+    column (Attribute: MinutesBasis, Caption: 'Minutes based on')
+    column (Attribute: IsCritical, Caption: 'Critical')
+    column (Attribute: SharePct, Caption: '% of trips')
+  }
+};
+
+/** The explanation behind every plan row: counts, percentiles, skipped slots */
+create page TripPlanning.PlanRun_Log folder 'Plan'
+(
+  Title: 'Why this plan',
+  Layout: Atlas_Core.Atlas_Default
+)
+{
+  datagrid dgRun (DataSource: database TripPlanning.PlanRunLog, PageSize: 50) {
+    column (Attribute: RunAt, Caption: 'When')
+    column (Attribute: PlanVersion, Caption: 'Version')
+    column (Attribute: Scope, Caption: 'Vendor | slot | day')
+    column (Attribute: Message, Caption: 'What happened')
+  }
+};
+
+-- MARK: LIVE: what is happening now ------------------------------------------
+
+/** Every gate entry being handled, with where it stands */
+create page TripPlanning.Trips_Board folder 'Live'
+(
+  Title: 'Trips',
+  Layout: Atlas_Core.Atlas_Default
+)
+{
+  datagrid dgTrips (DataSource: database TripPlanning.Trip, PageSize: 50) {
+    column (Attribute: GateIn, Caption: 'Gate in')
+    column (Attribute: TruckId, Caption: 'Truck')
+    column (Attribute: Vendor, Caption: 'Vendor')
+    column (Attribute: Slot, Caption: 'Slot')
+    column (Attribute: Status, Caption: 'Status')
+    column (Attribute: NextSeq, Caption: 'Next stop #')
+  }
+};
+
+/** Bay state: occupied by the feed, reserved by an allocation */
+create page TripPlanning.Bays_Board folder 'Live'
+(
+  Title: 'Bays',
+  Layout: Atlas_Core.Atlas_Default
+)
+{
+  datagrid dgBays (DataSource: database TripPlanning.Bay, PageSize: 60) {
+    column (Attribute: Code, Caption: 'Bay')
+    column (Attribute: IsHotLane, Caption: 'Hot lane')
+    column (Attribute: Occupied, Caption: 'Occupied')
+    column (Attribute: ReservedUntil, Caption: 'Held until')
+    controlbar {
+      actionbutton btnNew (Caption: 'New bay', Action: call microflow TripPlanning.ACT_Bay_New, ButtonStyle: Primary)
+      actionbutton btnEdit (Caption: 'Edit', Action: show page TripPlanning.Bay_Edit)
+    }
+  }
+};
+
+create page TripPlanning.Bay_Edit folder 'Live'
+(
+  Params: ( $Bay: TripPlanning.Bay ),
+  Title: 'Bay',
+  Layout: Atlas_Core.PopupLayout
+)
+{
+  dataview dvBay (DataSource: $Bay) {
+    textbox txtCode (Label: 'Bay code', Attribute: Code)
+    checkbox cbHot (Label: 'Hot-lane bay', Attribute: IsHotLane)
+    footer {
+      actionbutton btnSave (Caption: 'Save', Action: save changes, ButtonStyle: Primary)
+      actionbutton btnCancel (Caption: 'Cancel', Action: cancel changes)
+    }
+  }
+};
+
+/** Which truck went to which bay, planned or swapped */
+create page TripPlanning.Allocations_Log folder 'Live'
+(
+  Title: 'Allocations',
+  Layout: Atlas_Core.Atlas_Default
+)
+{
+  datagrid dgAlloc (DataSource: database TripPlanning.Allocation, PageSize: 50) {
+    column (Attribute: Start, Caption: 'Sent at')
+    column (Attribute: ExpectedEnd, Caption: 'Expected end')
+    column (Attribute: ActualEnd, Caption: 'Actual end')
+    column (Attribute: Swapped, Caption: 'Moved to fallback')
+    column (Attribute: Reason, Caption: 'Reason')
+  }
+};
+
+/** Hot trips, withdrawals, overruns */
+create page TripPlanning.Exceptions_Log folder 'Live'
+(
+  Title: 'Exceptions',
+  Layout: Atlas_Core.Atlas_Default
+)
+{
+  datagrid dgExc (DataSource: database TripPlanning.ExceptionLog, PageSize: 50) {
+    column (Attribute: LoggedAt, Caption: 'When')
+    column (Attribute: ExceptionType, Caption: 'Type')
+    column (Attribute: Reason, Caption: 'Reason')
+  }
+};
+
+-- MARK: SETUP DATA -----------------------------------------------------------
+
+create page TripPlanning.Settings_Overview folder 'Setup'
+(
+  Title: 'Plan settings',
+  Layout: Atlas_Core.Atlas_Default
+)
+{
+  datagrid dgSet (DataSource: database TripPlanning.PlanSettings) {
+    column (Attribute: HistoryWeeks, Caption: 'History (weeks)')
+    column (Attribute: QStart, Caption: 'Safe start percentile')
+    column (Attribute: QStop, Caption: 'Hard stop percentile')
+    column (Attribute: GraceMin, Caption: 'Grace (min)')
+    column (Attribute: MinTrucks, Caption: 'Min trucks')
+    column (Attribute: MinRunPct, Caption: 'Min runs %')
+    column (Attribute: ManualMin, Caption: 'Manual min/stop')
+    controlbar {
+      actionbutton btnEdit (Caption: 'Edit', Action: show page TripPlanning.Settings_Edit, ButtonStyle: Primary)
+    }
+  }
+};
+
+create page TripPlanning.Settings_Edit folder 'Setup'
+(
+  Params: ( $Settings: TripPlanning.PlanSettings ),
+  Title: 'Plan settings',
+  Layout: Atlas_Core.PopupLayout
+)
+{
+  dataview dvSet (DataSource: $Settings) {
+    textbox txtHist (Label: 'History (weeks)', Attribute: HistoryWeeks)
+    textbox txtQStart (Label: 'Safe start percentile (0.80 = P80)', Attribute: QStart)
+    textbox txtQStop (Label: 'Hard stop percentile (0.95 = P95)', Attribute: QStop)
+    textbox txtGrace (Label: 'Grace after hard stop (min)', Attribute: GraceMin)
+    textbox txtRound (Label: 'Round to (min)', Attribute: RoundMin)
+    textbox txtMinT (Label: 'Min trucks for own timing', Attribute: MinTrucks)
+    textbox txtMinR (Label: 'Min % of days a vendor runs', Attribute: MinRunPct)
+    textbox txtAllow (Label: 'Allowance %', Attribute: AllowancePct)
+    textbox txtFixed (Label: 'Fixed minutes per stop', Attribute: FixedMin)
+    textbox txtQMin (Label: 'Stop minutes percentile', Attribute: QStopMinutes)
+    textbox txtManual (Label: 'Manual minutes per stop', Attribute: ManualMin)
+    textbox txtGap (Label: 'Gap between stops (min)', Attribute: GapMin)
+    footer {
+      actionbutton btnSave (Caption: 'Save', Action: save changes, ButtonStyle: Primary)
+      actionbutton btnCancel (Caption: 'Cancel', Action: cancel changes)
+    }
+  }
+};
+
+create page TripPlanning.ItemStandard_Overview folder 'Setup'
+(
+  Title: 'Item standards',
+  Layout: Atlas_Core.Atlas_Default
+)
+{
+  datagrid dgItems (DataSource: database TripPlanning.ItemStandard, PageSize: 30) {
+    column (Attribute: Item, Caption: 'Item')
+    column (Attribute: PackSize, Caption: 'Pack size')
+    column (Attribute: StdMinutes, Caption: 'Std minutes')
+    column (Attribute: Basis, Caption: 'Per')
+    column (Attribute: IsCritical, Caption: 'Critical')
+    controlbar {
+      actionbutton btnNew (Caption: 'New item', Action: call microflow TripPlanning.ACT_ItemStandard_New, ButtonStyle: Primary)
+      actionbutton btnEdit (Caption: 'Edit', Action: show page TripPlanning.ItemStandard_Edit)
+    }
+  }
+};
+
+create page TripPlanning.ItemStandard_Edit folder 'Setup'
+(
+  Params: ( $ItemStandard: TripPlanning.ItemStandard ),
+  Title: 'Item standard',
+  Layout: Atlas_Core.PopupLayout
+)
+{
+  dataview dvItem (DataSource: $ItemStandard) {
+    textbox txtItem (Label: 'Item', Attribute: Item)
+    textbox txtPack (Label: 'Pack size', Attribute: PackSize)
+    textbox txtStd (Label: 'Standard unloading minutes', Attribute: StdMinutes)
+    textbox txtBasis (Label: 'Per (per pack / per piece / per stop)', Attribute: Basis)
+    checkbox cbCrit (Label: 'Critical part', Attribute: IsCritical)
+    footer {
+      actionbutton btnSave (Caption: 'Save', Action: save changes, ButtonStyle: Primary)
+      actionbutton btnCancel (Caption: 'Cancel', Action: cancel changes)
+    }
+  }
+};
+
+/** Loaded history the plan is built from, read-only */
+create page TripPlanning.GateEntry_Overview folder 'Setup'
+(
+  Title: 'Gate-entry history',
+  Layout: Atlas_Core.Atlas_Default
+)
+{
+  datagrid dgGate (DataSource: database TripPlanning.GateEntry, PageSize: 50) {
+    column (Attribute: SupplyDate, Caption: 'Supply date')
+    column (Attribute: Slot, Caption: 'Slot')
+    column (Attribute: Vendor, Caption: 'Vendor')
+    column (Attribute: TruckId, Caption: 'Truck')
+    column (Attribute: GateIn, Caption: 'Gate in')
+    column (Attribute: Bay, Caption: 'Bay')
+    column (Attribute: Item, Caption: 'Item')
+    column (Attribute: ReceivedQty, Caption: 'Received')
+  }
+};

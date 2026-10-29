@@ -122,6 +122,17 @@ create association TripPlanning.PlanStop_Bay
   from TripPlanning.PlanStop to TripPlanning.Bay
   type reference;
 
+/** One line per decision GeneratePlan makes, so a plan can be explained on a page */
+@position(1000, 400)
+create persistent entity TripPlanning.PlanRunLog (
+  RunAt: datetime,
+  PlanVersion: integer,
+  /** 'run' or 'vendor | slot | day' */
+  Scope: string(80),
+  Message: string(500)
+)
+index (PlanVersion);
+
 -- MARK: JAVA ACTION ----------------------------------------------------------
 
 /**
@@ -166,8 +177,10 @@ ZoneId zone = ZoneId.systemDefault();
 
 // 1. Trips: one per truck + gate-entry time (a returning truck is a new trip)
 Map<String, Trip> trips = new HashMap<>();
+long rowsRead = 0;
 for (IMendixObject o : Core.retrieveXPathQuery(ctx,
         "//TripPlanning.GateEntry[SupplyDate >= '" + from + "']")) {
+    rowsRead++;
     GateEntry g = GateEntry.initialize(ctx, o);
     if (g.getGateIn() == null || g.getSupplyDate() == null || g.getSlot() == null) continue;
     LocalDate d = g.getSupplyDate().toInstant().atZone(zone).toLocalDate();
@@ -203,6 +216,12 @@ for (IMendixObject o : Core.retrieveXPathQuery(ctx, "//TripPlanning.VendorSlotPl
     if (v != null && v >= version) version = v + 1;
 }
 
+runLog(ctx, version, "run", "Read " + rowsRead + " gate-entry rows since " + from
+    + (wd.isEmpty() ? "" : " (" + wd + " only)") + " -> " + trips.size() + " trips, "
+    + (trips.size() - kept.size()) + " dropped for arriving more than "
+    + Settings.getEarlyCapH() + "h before / " + Settings.getLateCapH() + "h after the slot; "
+    + allDays + " days, " + std.size() + " item standards loaded.");
+
 // 2. Per vendor + slot
 Map<String, List<Trip>> groups = kept.stream().collect(Collectors.groupingBy(t -> t.vendor + "|" + t.slot));
 long written = 0;
@@ -212,7 +231,11 @@ for (Map.Entry<String, List<Trip>> e : groups.entrySet()) {
     List<Trip> g = e.getValue();
     long runDays = g.stream().map(t -> t.date).distinct().count();
     int runsPct = (int) Math.round(100.0 * runDays / Math.max(allDays, 1));
-    if (runsPct < Settings.getMinRunPct()) continue;
+    if (runsPct < Settings.getMinRunPct()) {
+        runLog(ctx, version, vendor + " | " + slot + " | " + (wd.isEmpty() ? "All" : wd),
+            "Not planned: runs on " + runsPct + "% of days, below the " + Settings.getMinRunPct() + "% minimum.");
+        continue;
+    }
 
     List<Double> own = g.stream().map(t -> t.offset).sorted().collect(Collectors.toList());
     boolean useOwn = own.size() >= Settings.getMinTrucks();
@@ -239,6 +262,12 @@ for (Map.Entry<String, List<Trip>> e : groups.entrySet()) {
     p.setIsActive(true);
     p.commit();
     written++;
+    runLog(ctx, version, vendor + " | " + slot + " | " + (wd.isEmpty() ? "All" : wd),
+        (useOwn ? "Own history, " : "Slot default (only ") + own.size() + (useOwn ? " trucks" : " own trucks)")
+        + ", runs on " + runsPct + "% of days. P" + Math.round(Settings.getQStart().doubleValue() * 100)
+        + " = " + Math.round(a) + " min -> safe start " + safe + " min after slot; P"
+        + Math.round(Settings.getQStop().doubleValue() * 100) + " = " + Math.round(b)
+        + " min + " + Settings.getGraceMin() + " grace -> hard stop " + hard + " min after slot.");
 
     // 3. Bay list: >= 10% of trips, top 5; critical bays first, then share
     Map<String, Long> visits = new HashMap<>();
@@ -313,6 +342,16 @@ for (Map.Entry<String, List<Trip>> e : groups.entrySet()) {
 return written;
 $$
 extra code $$
+private static void runLog(com.mendix.systemwideinterfaces.core.IContext ctx, int version,
+        String scope, String msg) throws Exception {
+    tripplanning.proxies.PlanRunLog l = new tripplanning.proxies.PlanRunLog(ctx);
+    l.setRunAt(new java.util.Date());
+    l.setPlanVersion(version);
+    l.setScope(scope.length() > 80 ? scope.substring(0, 80) : scope);
+    l.setMessage(msg.length() > 500 ? msg.substring(0, 500) : msg);
+    l.commit();
+}
+
 private static final class Trip {
     String vendor, slot;
     java.time.LocalDate date;

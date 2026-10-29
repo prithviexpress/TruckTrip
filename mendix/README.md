@@ -21,6 +21,21 @@ Not validated here: I could not run `mxcli check` in this environment. Expect a
 syntax nit or two on the first run; the statement forms follow the mxcli docs and
 examples in the repo.
 
+## Pages (third script)
+`tripplanning_pages.mdl` adds one page per thing you want to see. Apply it after the other
+two, then add the pages to the navigation in Studio Pro.
+
+| Page | Shows |
+|---|---|
+| Plan_Overview / Plan_Detail | every vendor-slot plan row, its safe start, hard stop and ordered bays |
+| PlanRun_Log | why: rows read, trips kept, percentiles used, slots skipped |
+| Trips_Board / Bays_Board | gate entries and their status; bays with occupancy and holds |
+| Allocations_Log / Exceptions_Log | who was sent where; hot trips, withdrawals, overruns |
+| Settings_*, ItemStandard_*, GateEntry_Overview | the inputs |
+
+First step: load a small `Bay`, `ItemStandard` and `GateEntry` sample, press
+"Generate plan now" on Plan_Overview, then read PlanRun_Log.
+
 ## Re-running
 The scripts create the module, so a second run fails with "already exists". To start
 over, restore your backup, or run `00_reset.mdl` (drops module TripPlanning) and apply
