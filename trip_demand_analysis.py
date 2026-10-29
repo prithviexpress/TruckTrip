@@ -1424,7 +1424,7 @@ def report_rows(m: pd.DataFrame, days, qty_mode: str):
                           if pd.notna(g)])
         label = (f"Trip{trip}\nfrom {slot_clock('00:00', mins.min())}\n"
                  f"median {slot_clock('00:00', mins.median())}\n"
-                 f"last {slot_clock('00:00', mins.max())}" if len(mins) else f"Trip{trip}")
+                 f"P90 {slot_clock('00:00', mins.quantile(0.9))}" if len(mins) else f"Trip{trip}")
         rows.append({"supply": sup, "trip": label, "item": "Gate entry",
                      "loc": "", "kind": "gate",
                      "vals": [_fmt_gate(grow.get(d), d) for d in days]})
@@ -1570,7 +1570,7 @@ def trip_report_tab(path, dr, locs, vendors, df):
     k[0].metric("Supply times", len({r["supply"] for r in rows}))
     k[1].metric("Trips (max per slot)", len({(r["supply"], r["trip"]) for r in rows}))
     st.caption("Trip cell: from = earliest gate entry of that trip in the month, median "
-               "= typical, last = latest; (+1d) means after midnight.")
+               "= typical, P90 = 90% of entries were in by then; (+1d) means after midnight.")
     k[2].metric("Item rows", sum(r["kind"] == "item" for r in rows))
     if rows:
         st.markdown(report_html(rows, days), unsafe_allow_html=True)
